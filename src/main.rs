@@ -1,4 +1,9 @@
-use std::{env, thread, io::{Read, Write, ErrorKind}, net::{TcpStream, TcpListener}};
+use std::{
+    thread,
+    sync::{mpsc, Arc, Mutex},
+    net::{TcpStream, TcpListener},
+    io::{Read, Write, ErrorKind},
+};
 use pcap::{Device, Capture};
 
 struct TcpInfo {
@@ -9,95 +14,6 @@ struct TcpInfo {
     seq: u32,
     ack: u32,
     flags: String,
-}
-
-fn handle_client(mut stream: TcpStream) {
-    let peer_addr = stream.peer_addr()
-        .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
-    
-    println!("Handling connection from: {}", peer_addr);
-    let mut buffer = [0; 1024];
-
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                println!("Client Closed. EOF for {}", peer_addr);
-                break;
-            }
-            Ok(n) => {
-                println!("Application received {} bytes: {:02x?}", n, &buffer[0..n]);
-                if let Err(e) = stream.write_all(&buffer[0..n]) {
-                    eprintln!("Write error to client {}: {:?}", peer_addr, e);
-                    break;
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => {
-                if e.kind() == ErrorKind::ConnectionReset {
-                    println!("Client {} reset connection", peer_addr);
-                } else {
-                    eprintln!("Read error from client {}: {:?}", peer_addr, e);
-                }
-                break;
-            }
-        }
-    }
-    println!("Connection finished for: {}", peer_addr);
-}
-
-fn capture_packets() {
-    let devices = Device::list().expect("Failed to list devices");
-    let use_loopback = env::var("TEST_MODE").is_ok();
-    
-    let device = if use_loopback {
-        devices.iter().find(|d| 
-            d.desc.as_ref()
-                .map(|s| s.to_lowercase().contains("loopback"))
-                .unwrap_or(false)
-        ).expect("Loopback not found")
-    } else {
-        devices.iter().find(|d| {
-            let desc = d.desc.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
-            desc.contains("wi-fi") || desc.contains("ethernet")
-        }).expect("Network adapter not found")
-    }.clone();
-    
-    println!("Capturing on: {} ({})", device.name, 
-             device.desc.as_ref().unwrap_or(&"N/A".to_string()));
-    
-    let mut cap = Capture::from_device(device)
-        .expect("Failed to open device")
-        .promisc(true).snaplen(65535).timeout(1000)
-        .open().expect("Failed to activate capture");
-    
-    cap.filter("tcp port 9090", true).expect("Failed to set filter");
-    
-    loop {
-        match cap.next_packet() {
-            Ok(packet) => {
-                println!("═══════════════════════════════════════");
-                println!("Packet: {} bytes", packet.len());
-                
-                if let Some((tcp_info, payload)) = parse_packet(&packet.data) {
-                    println!("{}:{} -> {}:{}", 
-                             tcp_info.src_ip, tcp_info.src_port,
-                             tcp_info.dst_ip, tcp_info.dst_port);
-                    println!("Flags: {}", tcp_info.flags);
-                    println!("Seq: {}, Ack: {}", tcp_info.seq, tcp_info.ack);
-                    
-                    if !payload.is_empty() {
-                        println!("Payload: {} bytes: {:02x?}", payload.len(), payload);
-                        if let Ok(text) = std::str::from_utf8(payload) {
-                            println!("Text: {:?}", text);
-                        }
-                    }
-                }
-                println!("═══════════════════════════════════════\n");
-            }
-            Err(pcap::Error::TimeoutExpired) => continue,
-            Err(e) => eprintln!("Error capturing: {:?}", e),
-        }
-    }
 }
 
 fn parse_packet(packet: &[u8]) -> Option<(TcpInfo, &[u8])> {
@@ -149,17 +65,228 @@ fn parse_packet(packet: &[u8]) -> Option<(TcpInfo, &[u8])> {
     Some((TcpInfo { src_ip, dst_ip, src_port, dst_port, seq, ack, flags }, payload))
 }
 
+// Client Actor
+struct ClientActor {
+    receiver: mpsc::Receiver<ClientMessage>,
+    stream: TcpStream,
+    peer_addr: String,
+}
+
+enum ClientMessage {
+    ProcessData(Vec<u8>),
+    Shutdown,
+}
+
+impl ClientActor {
+    fn run(mut self) {
+        let mut buffer = [0; 1024];
+        
+        // Set non-blocking mode for stream to allow checking messages
+        self.stream.set_nonblocking(true).expect("Failed to set non-blocking");
+        
+        loop {
+            // Check for messages
+            if let Ok(msg) = self.receiver.try_recv() {
+                match msg {
+                    ClientMessage::ProcessData(data) => {
+                        println!("Processing {} bytes: {:02x?}", data.len(), &data);
+                        if let Err(e) = self.stream.write_all(&data) {
+                            eprintln!("Write error: {:?}", e);
+                            break;
+                        }
+                    }
+                    ClientMessage::Shutdown => {
+                        println!("Shutting down client {}", self.peer_addr);
+                        break;
+                    }
+                }
+            }
+            
+            // Try to read from socket
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    println!("Client closed: {}", self.peer_addr);
+                    break;
+                }
+                Ok(n) => {
+                    let data = buffer[0..n].to_vec();
+                    println!("Received {} bytes", n);
+                    
+                    // Echo back immediately
+                    if let Err(e) = self.stream.write_all(&data) {
+                        eprintln!("Write error: {:?}", e);
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // No data available, sleep briefly
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => {
+                    eprintln!("Read error: {:?}", e);
+                    break;
+                }
+            }
+        }
+        
+        println!("Connection finished: {}", self.peer_addr);
+    }
+}
+
+#[derive(Clone)]
+struct ClientHandle {
+    sender: mpsc::Sender<ClientMessage>,
+}
+
+impl ClientHandle {
+    fn new(stream: TcpStream) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        
+        let peer_addr = stream.peer_addr()
+            .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
+        
+        println!("New client actor for: {}", peer_addr);
+        
+        let actor = ClientActor {
+            receiver,
+            stream,
+            peer_addr,
+        };
+        
+        thread::spawn(move || actor.run());
+        
+        Self { sender }
+    }
+    
+    fn send_data(&self, data: Vec<u8>) -> Result<(), mpsc::SendError<ClientMessage>> {
+        self.sender.send(ClientMessage::ProcessData(data))
+    }
+    
+    fn shutdown(&self) -> Result<(), mpsc::SendError<ClientMessage>> {
+        self.sender.send(ClientMessage::Shutdown)
+    }
+}
+
+// Packet Capture Actor
+struct PacketCaptureActor {
+    receiver: mpsc::Receiver<CaptureMessage>,
+}
+
+enum CaptureMessage {
+    Start,
+    Stop,
+}
+
+impl PacketCaptureActor {
+    fn run(self) {
+        while let Ok(msg) = self.receiver.recv() {
+            match msg {
+                CaptureMessage::Start => {
+                    println!("Starting packet capture");
+                    self.capture_packets();
+                }
+                CaptureMessage::Stop => {
+                    println!("Stopping packet capture");
+                    break;
+                }
+            }
+        }
+    }
+    
+    fn capture_packets(&self) {
+        // Your existing capture logic
+        let devices = Device::list().expect("Failed to list devices");
+        let use_loopback = std::env::var("TEST_MODE").is_ok();
+        
+        let device = if use_loopback {
+            devices.iter().find(|d| 
+                d.desc.as_ref()
+                    .map(|s| s.to_lowercase().contains("loopback"))
+                    .unwrap_or(false)
+            ).expect("Loopback not found")
+        } else {
+            devices.iter().find(|d| {
+                let desc = d.desc.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
+                desc.contains("wi-fi") || desc.contains("ethernet")
+            }).expect("Network adapter not found")
+        }.clone();
+        
+        println!("Capturing on: {} ({})", device.name, 
+                 device.desc.as_ref().unwrap_or(&"N/A".to_string()));
+        
+        let mut cap = Capture::from_device(device)
+            .expect("Failed to open device")
+            .promisc(true).snaplen(65535).timeout(1000)
+            .open().expect("Failed to activate capture");
+        
+        cap.filter("tcp port 9090", true).expect("Failed to set filter");
+        
+        loop {
+            match cap.next_packet() {
+                Ok(packet) => {
+                    println!("═══════════════════════════════════════");
+                    println!("Packet: {} bytes", packet.len());
+                    
+                    if let Some((tcp_info, payload)) = parse_packet(&packet.data) {
+                        println!("{}:{} -> {}:{}", 
+                                 tcp_info.src_ip, tcp_info.src_port,
+                                 tcp_info.dst_ip, tcp_info.dst_port);
+                        println!("Flags: {}", tcp_info.flags);
+                        
+                        if !payload.is_empty() {
+                            println!("Payload: {} bytes", payload.len());
+                        }
+                    }
+                    println!("═══════════════════════════════════════\n");
+                }
+                Err(pcap::Error::TimeoutExpired) => continue,
+                Err(e) => eprintln!("Error capturing: {:?}", e),
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CaptureHandle {
+    sender: mpsc::Sender<CaptureMessage>,
+}
+
+impl CaptureHandle {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        
+        let actor = PacketCaptureActor { receiver };
+        
+        thread::spawn(move || actor.run());
+        
+        Self { sender }
+    }
+    
+    fn start(&self) -> Result<(), mpsc::SendError<CaptureMessage>> {
+        self.sender.send(CaptureMessage::Start)
+    }
+}
+
+// Keep your existing helper functions (TcpInfo, parse_packet)
+
 fn main() {
-    let addr = env::args().nth(1).unwrap_or_else(|| "0.0.0.0:9090".to_string());
+    let addr = std::env::args().nth(1).unwrap_or_else(|| "0.0.0.0:9090".to_string());
     
-    thread::spawn(|| capture_packets());
+    // Start capture actor
+    let capture_handle = CaptureHandle::new();
+    capture_handle.start().expect("Failed to start capture");
     
+    // Server actor could be added here too
     let listener = TcpListener::bind(&addr).expect("Failed to bind");
     println!("Server listening on {}", addr);
-
+    
+    // Store client handles if you need to manage them
+    let clients = Arc::new(Mutex::new(Vec::<ClientHandle>::new()));
+    
     for stream_result in listener.incoming() {
         if let Ok(stream) = stream_result {
-            thread::spawn(move || handle_client(stream));
+            let handle = ClientHandle::new(stream);
+            clients.lock().unwrap().push(handle);
         }
     }
 }
