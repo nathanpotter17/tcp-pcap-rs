@@ -124,3 +124,65 @@ DB Simplicity
 - Same query, same results: stable bases
 - Tx's well defined
     - functional accretion
+
+# STMs - Rich Hickey
+
+Uniform State Transistion Model
+- 'change-state' reference function [args*]
+- function will be passed current state of the reference (plus any args)
+- return value of function will be the next state of the reference
+- snapshot of 'current' state always available with de-ref
+- No user locking, and no deadlocks
+
+This means we are afforded a 'Persistent Edit', where
+- New value is function of the old
+- shares immutable structure
+- doesnt impede any readers
+- Edit is not impeded by any readers
+
+Next, our new version is just an Atomic State transistion.
+- Always coordinated: Anytime someone dereferences this AFTER the atomic state transistion, readers will see the new value.
+    - Multiple semantics
+- Next dereference sees the new value
+- Consumers of values are unaffected
+
+As of Refs and Transactions
+- Refs can only be changed within a transaction.
+- All changes are Atomic and Isolated
+    - All - or - None change model (atomicity)
+    whereby every change to a ref made within a tx
+    occurs or none do at all
+    - No tx sees the effects of any other tx's while
+    it is running
+- Transactions are speculative (You May Not Win, Retry Limit, and thus, no side effects)
+
+Gotchas
+- Read tracking is a faulty was of trying to solve the problem of well synced STMs
+- HashMaps DO NOT preserve ordering!
+
+Implementation - STM
+- Not a lock-free spinning optimistic design...
+- Uses locks, wait/notify to avoid churn
+- Deadlock detection + barging
+- One timestamp CAS is only global resource
+- No read tracking
+- Course grained orientation
+    - Refs + persistent data structures
+- Readers don't impede writers/readers, writers
+
+References to Immutable Values is Key!
+
+Another STM: Agentic State
+- Each agent manages independent state
+- state changes through actions, which are ordinary functions (state=>new-state)
+- actions are dispatched using send or send off which return immediately.
+- actions occur **async** on thread-pool threads
+- only one action per agent happens at a time, mailbox queue - serial processing.
+
+Agents State
+- Agent state always accessible, via deref/A,
+but may not reflect all actions.
+- Any dispatches made during an action are held until **after** the state
+- Agents coordinate with tx's - any dispatches made during a transaction are held until
+it commits
+- Agents are not Actors (Erlang/Scala)
