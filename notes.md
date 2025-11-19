@@ -1,3 +1,12 @@
+# TCP PCAP & STM
+
+```
+"Civilization advances by extending the number of important
+operations which we can perform without thinking about them."
+
+- Alfred North Whitehead
+```
+
 # The Actor Model
 
 ```rust
@@ -63,6 +72,14 @@ impl MyActorHandle {
 ```
 
 # Databases as Values - Rich Hickey
+
+```
+"Time is atomic, epochal succession of process events"
+```
+
+```
+"There is a becoming of continuity, but no continuity of becoming"
+```
 
 People call filesystems, key:value stores, and etc 'databases', however, they are
 quite the opposite. Databases are about leveraging data - if there is no leverage,
