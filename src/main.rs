@@ -16,55 +16,6 @@ struct TcpInfo {
     flags: String,
 }
 
-fn parse_packet(packet: &[u8]) -> Option<(TcpInfo, &[u8])> {
-    if packet.len() < 4 { return None; }
-    
-    let mut offset = 4; // Windows loopback header
-    
-    // IP header
-    if packet.len() < offset + 20 { return None; }
-    let ip_header_len = ((packet[offset] & 0x0F) * 4) as usize;
-    
-    // Extract IP addresses
-    let src_ip = format!("{}.{}.{}.{}", 
-        packet[offset + 12], packet[offset + 13], 
-        packet[offset + 14], packet[offset + 15]);
-    let dst_ip = format!("{}.{}.{}.{}", 
-        packet[offset + 16], packet[offset + 17], 
-        packet[offset + 18], packet[offset + 19]);
-    
-    offset += ip_header_len;
-    
-    // TCP header
-    if packet.len() < offset + 20 { return None; }
-    
-    let src_port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-    let dst_port = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
-    let seq = u32::from_be_bytes([
-        packet[offset + 4], packet[offset + 5], 
-        packet[offset + 6], packet[offset + 7]
-    ]);
-    let ack = u32::from_be_bytes([
-        packet[offset + 8], packet[offset + 9], 
-        packet[offset + 10], packet[offset + 11]
-    ]);
-    
-    let tcp_flags = packet[offset + 13];
-    let mut flags = String::new();
-    if tcp_flags & 0x02 != 0 { flags.push_str("SYN "); }
-    if tcp_flags & 0x10 != 0 { flags.push_str("ACK "); }
-    if tcp_flags & 0x01 != 0 { flags.push_str("FIN "); }
-    if tcp_flags & 0x04 != 0 { flags.push_str("RST "); }
-    if tcp_flags & 0x08 != 0 { flags.push_str("PSH "); }
-    
-    let tcp_header_len = ((packet[offset + 12] >> 4) * 4) as usize;
-    offset += tcp_header_len;
-    
-    let payload = if offset >= packet.len() { &[] } else { &packet[offset..] };
-    
-    Some((TcpInfo { src_ip, dst_ip, src_port, dst_port, seq, ack, flags }, payload))
-}
-
 // Client Actor
 struct ClientActor {
     receiver: mpsc::Receiver<ClientMessage>,
@@ -227,7 +178,7 @@ impl PacketCaptureActor {
                     println!("═══════════════════════════════════════");
                     println!("Packet: {} bytes", packet.len());
                     
-                    if let Some((tcp_info, payload)) = parse_packet(&packet.data) {
+                    if let Some((tcp_info, payload)) = Self::parse_packet(&packet.data) {
                         println!("{}:{} -> {}:{}", 
                                  tcp_info.src_ip, tcp_info.src_port,
                                  tcp_info.dst_ip, tcp_info.dst_port);
@@ -243,6 +194,55 @@ impl PacketCaptureActor {
                 Err(e) => eprintln!("Error capturing: {:?}", e),
             }
         }
+    }
+
+    fn parse_packet(packet: &[u8]) -> Option<(TcpInfo, &[u8])> {
+        if packet.len() < 4 { return None; }
+        
+        let mut offset = 4; // Windows loopback header
+        
+        // IP header
+        if packet.len() < offset + 20 { return None; }
+        let ip_header_len = ((packet[offset] & 0x0F) * 4) as usize;
+        
+        // Extract IP addresses
+        let src_ip = format!("{}.{}.{}.{}", 
+            packet[offset + 12], packet[offset + 13], 
+            packet[offset + 14], packet[offset + 15]);
+        let dst_ip = format!("{}.{}.{}.{}", 
+            packet[offset + 16], packet[offset + 17], 
+            packet[offset + 18], packet[offset + 19]);
+        
+        offset += ip_header_len;
+        
+        // TCP header
+        if packet.len() < offset + 20 { return None; }
+        
+        let src_port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let dst_port = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        let seq = u32::from_be_bytes([
+            packet[offset + 4], packet[offset + 5], 
+            packet[offset + 6], packet[offset + 7]
+        ]);
+        let ack = u32::from_be_bytes([
+            packet[offset + 8], packet[offset + 9], 
+            packet[offset + 10], packet[offset + 11]
+        ]);
+        
+        let tcp_flags = packet[offset + 13];
+        let mut flags = String::new();
+        if tcp_flags & 0x02 != 0 { flags.push_str("SYN "); }
+        if tcp_flags & 0x10 != 0 { flags.push_str("ACK "); }
+        if tcp_flags & 0x01 != 0 { flags.push_str("FIN "); }
+        if tcp_flags & 0x04 != 0 { flags.push_str("RST "); }
+        if tcp_flags & 0x08 != 0 { flags.push_str("PSH "); }
+        
+        let tcp_header_len = ((packet[offset + 12] >> 4) * 4) as usize;
+        offset += tcp_header_len;
+        
+        let payload = if offset >= packet.len() { &[] } else { &packet[offset..] };
+        
+        Some((TcpInfo { src_ip, dst_ip, src_port, dst_port, seq, ack, flags }, payload))
     }
 }
 
@@ -266,8 +266,6 @@ impl CaptureHandle {
         self.sender.send(CaptureMessage::Start)
     }
 }
-
-// Keep your existing helper functions (TcpInfo, parse_packet)
 
 fn main() {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "0.0.0.0:9090".to_string());
