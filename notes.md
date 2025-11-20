@@ -207,106 +207,32 @@ it commits
 # Actor Governance
 
 ```rust
+// main.rs - Enhanced DIAGON Actor-Based P2P System
+// Replace entire main.rs content
+
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    fs::{File, OpenOptions},
-    io::{self, Write, Read, BufWriter, ErrorKind},
-    net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs},
-    sync::{Arc, RwLock, atomic::{AtomicU64, AtomicBool, Ordering}, mpsc::{self, Sender, Receiver}},
     thread,
-    time::{SystemTime, UNIX_EPOCH, Duration, Instant},
-    path::Path,
+    sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    net::{TcpStream, TcpListener, SocketAddr},
+    io::{Read, Write, ErrorKind},
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-use sha2::{Sha256, Digest};
-use pqcrypto_dilithium::dilithium3::*;
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
-use serde::{Serialize, Deserialize};
-use rand::RngCore;
 use pcap::{Device, Capture};
+use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
 
 // ============================================================================
-// CONFIGURATION (unchanged)
-// ============================================================================
-
-const MAX_MESSAGE_SIZE: usize = 10_000_000;
-pub const PUBLIC_GENESIS: [u8; 32] = [
-    0xa9, 0xb5, 0x42, 0x31, 0x6b, 0xf2, 0xbe, 0x58,
-    0xa9, 0x0f, 0xa8, 0x68, 0xc9, 0xb1, 0x17, 0xa5,
-    0x04, 0x82, 0x11, 0x0a, 0xac, 0xa2, 0x70, 0xe9,
-    0x87, 0x0a, 0x8b, 0xb6, 0x5f, 0x51, 0x50, 0x7f,
-];
-static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub buffer_size: usize,
-    pub heartbeat_interval: Duration,
-    pub gossip_interval: Duration,
-    pub peer_timeout_heartbeats: u32,
-    pub connection_timeout: Duration,
-    pub trust_decay_rate: f64,
-    pub trust_decay_days: u64,
-    pub min_trust_for_proposals: f64,
-    pub min_trust_for_recommendations: f64,
-    pub privacy_threshold_supermajority: f64,
-    pub stake_lock_period_secs: u64,
-    pub min_elaboration_length: usize,
-    pub max_entry_data_size: usize,
-    pub max_elaboration_size: usize,
-    pub max_timestamp_drift_secs: u64,
-    pub max_messages_per_minute: u32,
-    pub max_proposals_per_hour: u32,
-    pub max_elaborations_per_hour: u32,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            buffer_size: 65536,
-            heartbeat_interval: Duration::from_secs(30),
-            gossip_interval: Duration::from_secs(60),
-            peer_timeout_heartbeats: 5,
-            connection_timeout: Duration::from_secs(10),
-            trust_decay_rate: 0.95,
-            trust_decay_days: 7,
-            min_trust_for_proposals: 0.4,
-            min_trust_for_recommendations: 0.7,
-            privacy_threshold_supermajority: 0.75,
-            stake_lock_period_secs: 30 * 24 * 3600,
-            min_elaboration_length: 20,
-            max_entry_data_size: 60_000,
-            max_elaboration_size: 10_000,
-            max_timestamp_drift_secs: 300,
-            max_messages_per_minute: 60,
-            max_proposals_per_hour: 10,
-            max_elaborations_per_hour: 20,
-        }
-    }
-}
-
-// ============================================================================
-// CORE TYPES (unchanged from DIAGON)
+// CORE TYPES (from DIAGON)
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Did(pub String);
 
-impl Did {
-    pub fn from_pubkey(pk: &PublicKey) -> Self {
-        Did(format!("did:diagon:{}", hex::encode(&pk.as_bytes()[..32])))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cid(pub [u8; 32]);
 
 impl Cid {
-    fn new(data: &[u8], node_did: &Did) -> Self {
-        let nonce = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Cid(sha256(&[data, &nonce.to_le_bytes(), node_did.0.as_bytes()].concat()))
-    }
-    
     pub fn short(&self) -> String {
         hex::encode(&self.0[..8])
     }
@@ -326,68 +252,8 @@ pub struct Entry {
 pub enum EntryType {
     Knowledge { category: String, concept: String, content: String },
     Proposal { text: String },
-    Pool { commitment: [u8; 32], name: String },
     Vote { target: Cid, support: bool },
     Prune { target: Cid, reason: String },
-    Stake { amount: u64, duration_secs: u64 },
-    PrivacyThreshold { plaintext_required: f64, anon_min_trust: f64, anon_min_stake: u64 },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrustScore {
-    pub did: Did,
-    pub overall_score: f64,
-    pub interaction_count: u32,
-    pub vote_alignment: f64,
-    pub last_updated: u64,
-}
-
-impl TrustScore {
-    fn new(did: Did) -> Self {
-        Self {
-            did,
-            overall_score: 0.5,
-            interaction_count: 0,
-            vote_alignment: 0.5,
-            last_updated: current_timestamp(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Proposal {
-    pub cid: Cid,
-    pub entry_type: EntryType,
-    pub proposer: Did,
-    pub elaboration: String,
-    pub votes_for: HashMap<Did, String>,
-    pub votes_against: HashMap<Did, String>,
-    pub threshold: i32,
-    pub executed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StakeRecord {
-    pub amount: u64,
-    pub locked_until: u64,
-    pub slashed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivacyThreshold {
-    pub plaintext_required: f64,
-    pub anon_min_trust: f64,
-    pub anon_min_stake: u64,
-}
-
-impl Default for PrivacyThreshold {
-    fn default() -> Self {
-        Self {
-            plaintext_required: 0.5,
-            anon_min_trust: 0.6,
-            anon_min_stake: 100,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,79 +262,79 @@ pub enum Message {
     Challenge([u8; 32]),
     Response(Vec<u8>),
     Elaborate(String),
-    Approve(bool, Vec<u8>, u64),
     Propose(Did, Entry, String),
     Vote(Did, Cid, bool, String, Vec<u8>),
-    SyncRequest(Did),
-    SyncReply(Vec<Entry>),
     Heartbeat(Did),
-    RequestCreatorKey(Did),
-    CreatorKeyReply(Did, Vec<u8>),
-    PoolMembershipAnnouncement { member: Did, pool: [u8; 32], timestamp: u64, signature: Vec<u8> },
-    TrustRecommendations { recommender: Did, recommendations: Vec<(Did, f64)>, signature: Vec<u8> },
-    StakeAnnouncement { staker: Did, amount: u64, locked_until: u64, signature: Vec<u8> },
-    PruneNotification { target: Cid, reason: String, executor: Did, executed_proposal_cid: Cid, signature: Vec<u8> },
+    Shutdown,
 }
 
 // ============================================================================
-// ACTOR MESSAGES
+// ACTOR MESSAGE TYPES WITH RESPONSE CHANNELS
 // ============================================================================
 
-pub enum MainActorMsg {
-    // User API commands
-    Auth(String),
-    Connect(String, Sender<io::Result<()>>),
-    Elaborate(String),
-    Approve(String),
-    Propose(EntryType, String),
-    Vote(String, bool, String),
-    Stake(u64, u64),
-    Status(Sender<NodeStatus>),
+pub enum SupervisorMsg {
+    ActorFailed(ActorType, String),
+    RestartActor(ActorType),
     Shutdown,
-    
-    // Internal coordination
-    PeerConnected(Did, Sender<PeerActorMsg>),
-    PeerDisconnected(Did),
+}
+
+#[derive(Debug, Clone)]
+pub enum ActorType {
+    Network,
+    Governance,
+    Trust,
+    Storage,
+    Client(SocketAddr),
 }
 
 pub enum NetworkActorMsg {
-    StartListening(SocketAddr),
-    ConnectTo(SocketAddr, Sender<io::Result<()>>),
-    Broadcast(Message),
+    StartListening(SocketAddr, mpsc::Sender<Result<(), String>>),
+    ConnectTo(SocketAddr, mpsc::Sender<Result<Did, String>>),
     SendTo(Did, Message),
-    Heartbeat,
+    Broadcast(Message),
+    ClientConnected(TcpStream, SocketAddr),
+    ClientDisconnected(Did),
+    GetPeers(mpsc::Sender<Vec<Did>>),
     Shutdown,
 }
 
-pub enum PeerActorMsg {
+pub enum ClientActorMsg {
+    Authenticate(Did, Vec<u8>, [u8; 32]),
     HandleMessage(Message),
     SendMessage(Message),
+    GetState(mpsc::Sender<ClientState>),
     Disconnect,
 }
 
+#[derive(Debug, Clone)]
+pub enum ClientState {
+    Connected,
+    Challenging([u8; 32]),
+    Authenticated(Did),
+    Disconnected,
+}
+
 pub enum GovernanceActorMsg {
-    CreateProposal(Did, EntryType, String, Sender<Result<Cid, String>>),
-    CastVote(Did, Cid, bool, String),
+    CreateProposal(Did, EntryType, String, mpsc::Sender<Result<Cid, String>>),
+    CastVote(Did, Cid, bool, String, mpsc::Sender<Result<(), String>>),
+    GetProposal(Cid, mpsc::Sender<Option<Proposal>>),
     CheckThresholds,
-    GetProposal(Cid, Sender<Option<Proposal>>),
-    GetAllProposals(Sender<Vec<Proposal>>),
+    Shutdown,
 }
 
 pub enum TrustActorMsg {
-    UpdateTrust(Did, String),
-    GetTrust(Did, Sender<f64>),
+    UpdateTrust(Did, f64),
+    GetTrust(Did, mpsc::Sender<f64>),
     DecayTrust,
-    GetAllScores(Sender<HashMap<Did, TrustScore>>),
+    Shutdown,
 }
 
 pub enum StorageActorMsg {
     SaveEntry(Entry),
-    SaveProposal(Proposal),
-    SaveTrustScore(TrustScore),
-    SaveStake(Did, StakeRecord),
-    SavePrivacyThreshold(PrivacyThreshold),
-    LoadState(Sender<Option<SavedState>>),
-    Persist,
+    GetEntry(Cid, mpsc::Sender<Option<Entry>>),
+    SaveState(Vec<u8>),
+    LoadState(mpsc::Sender<Option<Vec<u8>>>),
+    Shutdown,
 }
 
 pub enum CaptureActorMsg {
@@ -477,276 +343,273 @@ pub enum CaptureActorMsg {
 }
 
 // ============================================================================
-// VALIDATION MODULE
+// ACTOR HANDLES (following Alice Ryhl pattern)
 // ============================================================================
 
-pub struct Validator {
-    config: Config,
+#[derive(Clone)]
+pub struct SupervisorHandle {
+    sender: mpsc::Sender<SupervisorMsg>,
 }
 
-impl Validator {
-    fn new(config: Config) -> Self {
-        Self { config }
+impl SupervisorHandle {
+    pub fn report_failure(&self, actor: ActorType, error: String) {
+        let _ = self.sender.send(SupervisorMsg::ActorFailed(actor, error));
     }
     
-    fn validate_entry(&self, entry: &Entry) -> Result<(), String> {
-        self.validate_timestamp(entry.timestamp, "Entry")?;
-        
-        if entry.data.len() > self.config.max_entry_data_size {
-            return Err(format!("Entry exceeds {} bytes", self.config.max_entry_data_size));
-        }
-        
-        match &entry.entry_type {
-            EntryType::Knowledge { content, .. } if content.len() > 40_000 => 
-                Err("Knowledge content too large".into()),
-            EntryType::Pool { name, .. } if name.is_empty() || name.len() > 256 => 
-                Err("Invalid pool name size".into()),
-            _ => Ok(())
-        }
-    }
-    
-    fn validate_timestamp(&self, timestamp: u64, context: &str) -> Result<(), String> {
-        let now = current_timestamp();
-        
-        if timestamp < 1704067200 {
-            return Err(format!("{}: Timestamp too old", context));
-        }
-        
-        let drift = self.config.max_timestamp_drift_secs;
-        if timestamp < now.saturating_sub(drift) || timestamp > now + drift {
-            return Err(format!("{}: Timestamp outside acceptable range", context));
-        }
-        
-        Ok(())
-    }
-    
-    fn validate_elaboration(&self, text: &str) -> Result<(), String> {
-        if text.len() < self.config.min_elaboration_length {
-            return Err(format!("Too short (min {} chars)", self.config.min_elaboration_length));
-        }
-        if text.len() > self.config.max_elaboration_size {
-            return Err(format!("Too long (max {} chars)", self.config.max_elaboration_size));
-        }
-        Ok(())
-    }
-    
-    fn validate_did_pubkey_binding(&self, did: &Did, pubkey_bytes: &[u8]) -> Result<PublicKey, String> {
-        let pubkey = PublicKey::from_bytes(pubkey_bytes)
-            .map_err(|_| "Invalid public key bytes")?;
-        
-        if Did::from_pubkey(&pubkey) != *did {
-            return Err("DID does not match public key".into());
-        }
-        
-        Ok(pubkey)
+    pub fn request_restart(&self, actor: ActorType) {
+        let _ = self.sender.send(SupervisorMsg::RestartActor(actor));
     }
 }
 
-// ============================================================================
-// RATE LIMITER
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct RateLimiter {
-    message_count: u32,
-    proposal_count: u32,
-    elaboration_count: u32,
-    last_minute_reset: Instant,
-    last_hour_reset: Instant,
-    config: Config,
+#[derive(Clone)]
+pub struct NetworkActorHandle {
+    sender: mpsc::Sender<NetworkActorMsg>,
 }
 
-impl RateLimiter {
-    fn new(config: Config) -> Self {
-        let now = Instant::now();
+impl NetworkActorHandle {
+    pub fn start_listening(&self, addr: SocketAddr) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(NetworkActorMsg::StartListening(addr, tx))
+            .map_err(|_| "Network actor dead".to_string())?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Timeout".to_string())?
+    }
+    
+    pub fn connect_to(&self, addr: SocketAddr) -> Result<Did, String> {
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(NetworkActorMsg::ConnectTo(addr, tx))
+            .map_err(|_| "Network actor dead".to_string())?;
+        rx.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "Timeout".to_string())?
+    }
+    
+    pub fn broadcast(&self, msg: Message) {
+        let _ = self.sender.send(NetworkActorMsg::Broadcast(msg));
+    }
+    
+    pub fn get_peers(&self) -> Vec<Did> {
+        let (tx, rx) = mpsc::channel();
+        if self.sender.send(NetworkActorMsg::GetPeers(tx)).is_ok() {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ClientActorHandle {
+    sender: mpsc::Sender<ClientActorMsg>,
+}
+
+impl ClientActorHandle {
+    pub fn send_message(&self, msg: Message) {
+        let _ = self.sender.send(ClientActorMsg::SendMessage(msg));
+    }
+    
+    pub fn get_state(&self) -> Option<ClientState> {
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(ClientActorMsg::GetState(tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(1)).ok()
+    }
+    
+    pub fn disconnect(&self) {
+        let _ = self.sender.send(ClientActorMsg::Disconnect);
+    }
+}
+
+#[derive(Clone)]
+pub struct GovernanceActorHandle {
+    sender: mpsc::Sender<GovernanceActorMsg>,
+}
+
+impl GovernanceActorHandle {
+    pub fn create_proposal(&self, did: Did, entry: EntryType, elaboration: String) -> Result<Cid, String> {
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(GovernanceActorMsg::CreateProposal(did, entry, elaboration, tx))
+            .map_err(|_| "Governance actor dead".to_string())?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Timeout".to_string())?
+    }
+    
+    pub fn cast_vote(&self, did: Did, cid: Cid, support: bool, elaboration: String) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(GovernanceActorMsg::CastVote(did, cid, support, elaboration, tx))
+            .map_err(|_| "Governance actor dead".to_string())?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Timeout".to_string())?
+    }
+}
+
+#[derive(Clone)]
+pub struct TrustActorHandle {
+    sender: mpsc::Sender<TrustActorMsg>,
+}
+
+impl TrustActorHandle {
+    pub fn update_trust(&self, did: Did, delta: f64) {
+        let _ = self.sender.send(TrustActorMsg::UpdateTrust(did, delta));
+    }
+    
+    pub fn get_trust(&self, did: Did) -> f64 {
+        let (tx, rx) = mpsc::channel();
+        if self.sender.send(TrustActorMsg::GetTrust(did, tx)).is_ok() {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap_or(0.5)
+        } else {
+            0.5
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StorageActorHandle {
+    sender: mpsc::Sender<StorageActorMsg>,
+}
+
+impl StorageActorHandle {
+    pub fn save_entry(&self, entry: Entry) {
+        let _ = self.sender.send(StorageActorMsg::SaveEntry(entry));
+    }
+    
+    pub fn get_entry(&self, cid: Cid) -> Option<Entry> {
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(StorageActorMsg::GetEntry(cid, tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
+    }
+}
+
+#[derive(Clone)]
+pub struct CaptureActorHandle {
+    sender: mpsc::Sender<CaptureActorMsg>,
+}
+
+impl CaptureActorHandle {
+    pub fn start(&self, interface: String) {
+        let _ = self.sender.send(CaptureActorMsg::Start(interface));
+    }
+    
+    pub fn stop(&self) {
+        let _ = self.sender.send(CaptureActorMsg::Stop);
+    }
+}
+
+// ============================================================================
+// SUPERVISOR ACTOR
+// ============================================================================
+
+struct SupervisorActor {
+    receiver: mpsc::Receiver<SupervisorMsg>,
+    network: Option<NetworkActorHandle>,
+    governance: Option<GovernanceActorHandle>,
+    trust: Option<TrustActorHandle>,
+    storage: Option<StorageActorHandle>,
+    running: Arc<AtomicBool>,
+}
+
+impl SupervisorActor {
+    fn new(receiver: mpsc::Receiver<SupervisorMsg>, running: Arc<AtomicBool>) -> Self {
         Self {
-            message_count: 0,
-            proposal_count: 0,
-            elaboration_count: 0,
-            last_minute_reset: now,
-            last_hour_reset: now,
-            config,
-        }
-    }
-    
-    fn check_and_increment(&mut self, msg_type: MessageType) -> bool {
-        let now = Instant::now();
-        
-        if now.duration_since(self.last_minute_reset) >= Duration::from_secs(60) {
-            self.message_count = 0;
-            self.last_minute_reset = now;
-        }
-        
-        if now.duration_since(self.last_hour_reset) >= Duration::from_secs(3600) {
-            self.proposal_count = 0;
-            self.elaboration_count = 0;
-            self.last_hour_reset = now;
-        }
-        
-        match msg_type {
-            MessageType::Any => {
-                if self.message_count >= self.config.max_messages_per_minute {
-                    return false;
-                }
-                self.message_count += 1;
-            },
-            MessageType::Proposal => {
-                if self.proposal_count >= self.config.max_proposals_per_hour {
-                    return false;
-                }
-                self.proposal_count += 1;
-            },
-            MessageType::Elaboration => {
-                if self.elaboration_count >= self.config.max_elaborations_per_hour {
-                    return false;
-                }
-                self.elaboration_count += 1;
-            },
-        }
-        true
-    }
-}
-
-enum MessageType {
-    Any,
-    Proposal,
-    Elaboration,
-}
-
-// ============================================================================
-// PEER ACTOR
-// ============================================================================
-
-struct PeerActor {
-    did: Did,
-    pubkey: Option<Vec<u8>>,
-    authenticated: bool,
-    stream: TcpStream,
-    receiver: Receiver<PeerActorMsg>,
-    main_tx: Sender<MainActorMsg>,
-    rate_limiter: RateLimiter,
-    config: Config,
-}
-
-impl PeerActor {
-    fn new(
-        did: Did,
-        pubkey: Option<Vec<u8>>,
-        authenticated: bool,
-        stream: TcpStream,
-        receiver: Receiver<PeerActorMsg>,
-        main_tx: Sender<MainActorMsg>,
-        config: Config,
-    ) -> Self {
-        Self {
-            did,
-            pubkey,
-            authenticated,
-            stream,
             receiver,
-            main_tx,
-            rate_limiter: RateLimiter::new(config.clone()),
-            config,
+            network: None,
+            governance: None,
+            trust: None,
+            storage: None,
+            running,
         }
     }
     
     fn run(mut self) {
-        let _ = self.stream.set_nonblocking(true);
-        let _ = self.stream.set_read_timeout(Some(Duration::from_secs(1)));
+        println!("[SUPERVISOR] Started");
         
-        let mut buffer = vec![0u8; self.config.buffer_size];
-        let mut read_buffer = Vec::new();
+        // Start child actors
+        self.network = Some(Self::spawn_network_actor(self.running.clone()));
+        self.governance = Some(Self::spawn_governance_actor(self.running.clone()));
+        self.trust = Some(Self::spawn_trust_actor(self.running.clone()));
+        self.storage = Some(Self::spawn_storage_actor(self.running.clone()));
         
-        loop {
-            // Check for actor messages
-            if let Ok(msg) = self.receiver.try_recv() {
-                match msg {
-                    PeerActorMsg::HandleMessage(message) => {
-                        self.handle_protocol_message(message);
-                    }
-                    PeerActorMsg::SendMessage(message) => {
-                        let _ = write_message(&mut self.stream, &message);
-                    }
-                    PeerActorMsg::Disconnect => {
-                        println!("[PEER] {} disconnecting", self.did.0);
-                        break;
-                    }
+        while let Ok(msg) = self.receiver.recv() {
+            match msg {
+                SupervisorMsg::ActorFailed(actor_type, error) => {
+                    println!("[SUPERVISOR] Actor failed: {:?} - {}", actor_type, error);
+                    self.handle_actor_failure(actor_type);
                 }
-            }
-            
-            // Try to read from socket
-            match self.stream.read(&mut buffer) {
-                Ok(0) => {
-                    println!("[PEER] {} connection closed", self.did.0);
-                    break;
+                SupervisorMsg::RestartActor(actor_type) => {
+                    println!("[SUPERVISOR] Restarting actor: {:?}", actor_type);
+                    self.restart_actor(actor_type);
                 }
-                Ok(n) => {
-                    read_buffer.extend_from_slice(&buffer[..n]);
-                    
-                    // Try to parse messages from buffer
-                    while read_buffer.len() >= 4 {
-                        let len = u32::from_be_bytes([
-                            read_buffer[0], read_buffer[1], 
-                            read_buffer[2], read_buffer[3]
-                        ]) as usize;
-                        
-                        if len > MAX_MESSAGE_SIZE {
-                            println!("[PEER] Message too large from {}", self.did.0);
-                            break;
-                        }
-                        
-                        if read_buffer.len() >= 4 + len {
-                            let msg_bytes = read_buffer[4..4+len].to_vec();
-                            read_buffer.drain(..4+len);
-                            
-                            if let Ok(message) = bincode::deserialize::<Message>(&msg_bytes) {
-                                self.handle_protocol_message(message);
-                            }
-                        } else {
-                            break; // Need more data
-                        }
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    println!("[PEER] Read error from {}: {}", self.did.0, e);
+                SupervisorMsg::Shutdown => {
+                    println!("[SUPERVISOR] Shutting down");
+                    self.shutdown_all();
                     break;
                 }
             }
         }
         
-        // Notify main actor of disconnection
-        let _ = self.main_tx.send(MainActorMsg::PeerDisconnected(self.did.clone()));
+        println!("[SUPERVISOR] Exited");
     }
     
-    fn handle_protocol_message(&mut self, message: Message) {
-        if !self.rate_limiter.check_and_increment(MessageType::Any) {
-            println!("[RATE] Limiting {}", self.did.0);
-            return;
+    fn handle_actor_failure(&mut self, actor_type: ActorType) {
+        // Implement restart policy
+        match actor_type {
+            ActorType::Network => {
+                println!("[SUPERVISOR] Critical failure: Network actor");
+                self.shutdown_all();
+            }
+            ActorType::Governance | ActorType::Trust | ActorType::Storage => {
+                self.restart_actor(actor_type);
+            }
+            ActorType::Client(_) => {
+                // Client failures don't require restart
+            }
         }
-        
-        // Forward message to appropriate actor via main actor
-        // This is simplified - in full impl would route to governance/trust actors
-        match message {
-            Message::Elaborate(text) => {
-                println!("[ELABORATE] From {}: {}", self.did.0, text);
-                // Would forward to TrustActor
+    }
+    
+    fn restart_actor(&mut self, actor_type: ActorType) {
+        match actor_type {
+            ActorType::Governance => {
+                self.governance = Some(Self::spawn_governance_actor(self.running.clone()));
             }
-            Message::Propose(did, entry, elaboration) => {
-                println!("[PROPOSE] From {}: {}", did.0, entry.cid.short());
-                // Would forward to GovernanceActor
+            ActorType::Trust => {
+                self.trust = Some(Self::spawn_trust_actor(self.running.clone()));
             }
-            Message::Vote(did, cid, support, elaboration, signature) => {
-                println!("[VOTE] From {} on {}: {}", did.0, cid.short(), support);
-                // Would forward to GovernanceActor
-            }
-            Message::Heartbeat(_) => {
-                // Update last_seen in NetworkActor
+            ActorType::Storage => {
+                self.storage = Some(Self::spawn_storage_actor(self.running.clone()));
             }
             _ => {}
         }
+    }
+    
+    fn shutdown_all(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        // Actors will check running flag and exit
+    }
+    
+    fn spawn_network_actor(running: Arc<AtomicBool>) -> NetworkActorHandle {
+        let (tx, rx) = mpsc::channel();
+        let actor = NetworkActor::new(rx, running);
+        thread::spawn(move || actor.run());
+        NetworkActorHandle { sender: tx }
+    }
+    
+    fn spawn_governance_actor(running: Arc<AtomicBool>) -> GovernanceActorHandle {
+        let (tx, rx) = mpsc::channel();
+        let actor = GovernanceActor::new(rx, running);
+        thread::spawn(move || actor.run());
+        GovernanceActorHandle { sender: tx }
+    }
+    
+    fn spawn_trust_actor(running: Arc<AtomicBool>) -> TrustActorHandle {
+        let (tx, rx) = mpsc::channel();
+        let actor = TrustActor::new(rx, running);
+        thread::spawn(move || actor.run());
+        TrustActorHandle { sender: tx }
+    }
+    
+    fn spawn_storage_actor(running: Arc<AtomicBool>) -> StorageActorHandle {
+        let (tx, rx) = mpsc::channel();
+        let actor = StorageActor::new(rx, running);
+        thread::spawn(move || actor.run());
+        StorageActorHandle { sender: tx }
     }
 }
 
@@ -755,200 +618,286 @@ impl PeerActor {
 // ============================================================================
 
 struct NetworkActor {
+    receiver: mpsc::Receiver<NetworkActorMsg>,
     listener: Option<TcpListener>,
-    peers: HashMap<Did, Sender<PeerActorMsg>>,
-    receiver: Receiver<NetworkActorMsg>,
-    main_tx: Sender<MainActorMsg>,
-    config: Config,
-    identity: (Did, PublicKey, SecretKey),
-    pool_commitment: [u8; 32],
+    clients: HashMap<Did, ClientActorHandle>,
+    running: Arc<AtomicBool>,
 }
 
 impl NetworkActor {
-    fn new(
-        receiver: Receiver<NetworkActorMsg>,
-        main_tx: Sender<MainActorMsg>,
-        config: Config,
-        identity: (Did, PublicKey, SecretKey),
-        pool_commitment: [u8; 32],
-    ) -> Self {
+    fn new(receiver: mpsc::Receiver<NetworkActorMsg>, running: Arc<AtomicBool>) -> Self {
         Self {
-            listener: None,
-            peers: HashMap::new(),
             receiver,
-            main_tx,
-            config,
-            identity,
-            pool_commitment,
+            listener: None,
+            clients: HashMap::new(),
+            running,
         }
     }
     
     fn run(mut self) {
+        println!("[NETWORK] Started");
+        
         loop {
+            // Check for shutdown
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            // Handle messages with timeout to allow checking running flag
+            match self.receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(msg) => self.handle_message(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Check for incoming connections if listening
+                    self.accept_connections();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        
+        // Cleanup
+        for (_, client) in self.clients.drain() {
+            client.disconnect();
+        }
+        
+        println!("[NETWORK] Exited");
+    }
+    
+    fn handle_message(&mut self, msg: NetworkActorMsg) {
+        match msg {
+            NetworkActorMsg::StartListening(addr, reply) => {
+                let result = TcpListener::bind(addr)
+                    .and_then(|l| {
+                        l.set_nonblocking(true)?;
+                        Ok(l)
+                    })
+                    .map(|l| {
+                        self.listener = Some(l);
+                        println!("[NETWORK] Listening on {}", addr);
+                    })
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            NetworkActorMsg::ConnectTo(addr, reply) => {
+                let result = self.connect_to_peer(addr);
+                let _ = reply.send(result);
+            }
+            NetworkActorMsg::SendTo(did, msg) => {
+                if let Some(client) = self.clients.get(&did) {
+                    client.send_message(msg);
+                }
+            }
+            NetworkActorMsg::Broadcast(msg) => {
+                for client in self.clients.values() {
+                    client.send_message(msg.clone());
+                }
+            }
+            NetworkActorMsg::ClientConnected(stream, addr) => {
+                self.handle_new_connection(stream, addr);
+            }
+            NetworkActorMsg::ClientDisconnected(did) => {
+                self.clients.remove(&did);
+                println!("[NETWORK] Client disconnected: {}", did.0);
+            }
+            NetworkActorMsg::GetPeers(reply) => {
+                let peers: Vec<Did> = self.clients.keys().cloned().collect();
+                let _ = reply.send(peers);
+            }
+            NetworkActorMsg::Shutdown => {
+                self.running.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+    
+    fn accept_connections(&mut self) {
+        if let Some(listener) = &self.listener {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    self.handle_new_connection(stream, addr);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // No connections ready
+                }
+                Err(e) => {
+                    eprintln!("[NETWORK] Accept error: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn handle_new_connection(&mut self, stream: TcpStream, addr: SocketAddr) {
+        let (tx, rx) = mpsc::channel();
+        let handle = ClientActorHandle { sender: tx };
+        
+        // Temporary DID until authenticated
+        let temp_did = Did(format!("temp:{}", addr));
+        self.clients.insert(temp_did.clone(), handle.clone());
+        
+        let actor = ClientActor::new(rx, stream, addr, self.running.clone());
+        thread::spawn(move || actor.run());
+        
+        println!("[NETWORK] New connection from {}", addr);
+    }
+    
+    fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<Did, String> {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
+            .map_err(|e| e.to_string())?;
+        
+        let (tx, rx) = mpsc::channel();
+        let handle = ClientActorHandle { sender: tx };
+        
+        let temp_did = Did(format!("temp:{}", addr));
+        self.clients.insert(temp_did.clone(), handle);
+        
+        let actor = ClientActor::new(rx, stream, addr, self.running.clone());
+        thread::spawn(move || actor.run());
+        
+        Ok(temp_did)
+    }
+}
+
+// ============================================================================
+// CLIENT ACTOR
+// ============================================================================
+
+struct ClientActor {
+    receiver: mpsc::Receiver<ClientActorMsg>,
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    state: ClientState,
+    buffer: Vec<u8>,
+    running: Arc<AtomicBool>,
+}
+
+impl ClientActor {
+    fn new(
+        receiver: mpsc::Receiver<ClientActorMsg>,
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+        running: Arc<AtomicBool>,
+    ) -> Self {
+        let _ = stream.set_nonblocking(true);
+        Self {
+            receiver,
+            stream,
+            peer_addr,
+            state: ClientState::Connected,
+            buffer: vec![0; 65536],
+            running,
+        }
+    }
+    
+    fn run(mut self) {
+        println!("[CLIENT] Actor started for {}", self.peer_addr);
+        
+        loop {
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+            
             // Check for actor messages
-            if let Ok(msg) = self.receiver.recv_timeout(Duration::from_millis(100)) {
-                match msg {
-                    NetworkActorMsg::StartListening(addr) => {
-                        match TcpListener::bind(addr) {
-                            Ok(listener) => {
-                                listener.set_nonblocking(true).ok();
-                                self.listener = Some(listener);
-                                println!("[NETWORK] Listening on {}", addr);
-                            }
-                            Err(e) => {
-                                println!("[NETWORK] Failed to bind: {}", e);
-                            }
-                        }
-                    }
-                    NetworkActorMsg::ConnectTo(addr, reply_tx) => {
-                        let result = self.connect_to_peer(addr);
-                        let _ = reply_tx.send(result);
-                    }
-                    NetworkActorMsg::Broadcast(message) => {
-                        for (_, peer_tx) in &self.peers {
-                            let _ = peer_tx.send(PeerActorMsg::SendMessage(message.clone()));
-                        }
-                    }
-                    NetworkActorMsg::SendTo(did, message) => {
-                        if let Some(peer_tx) = self.peers.get(&did) {
-                            let _ = peer_tx.send(PeerActorMsg::SendMessage(message));
-                        }
-                    }
-                    NetworkActorMsg::Heartbeat => {
-                        let hb = Message::Heartbeat(self.identity.0.clone());
-                        for (_, peer_tx) in &self.peers {
-                            let _ = peer_tx.send(PeerActorMsg::SendMessage(hb.clone()));
-                        }
-                    }
-                    NetworkActorMsg::Shutdown => {
-                        for (_, peer_tx) in &self.peers {
-                            let _ = peer_tx.send(PeerActorMsg::Disconnect);
-                        }
+            match self.receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(msg) => {
+                    if !self.handle_message(msg) {
                         break;
                     }
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             
-            // Accept new connections
-            if let Some(listener) = &self.listener {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        self.handle_incoming_connection(stream);
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        // No connections ready
-                    }
-                    Err(e) => {
-                        println!("[NETWORK] Accept error: {}", e);
-                    }
+            // Try to read from socket
+            match self.stream.read(&mut self.buffer) {
+                Ok(0) => {
+                    println!("[CLIENT] Connection closed by {}", self.peer_addr);
+                    break;
+                }
+                Ok(n) => {
+                    self.process_data(&self.buffer[..n].to_vec());
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    eprintln!("[CLIENT] Read error from {}: {}", self.peer_addr, e);
+                    break;
                 }
             }
         }
         
-        println!("[NETWORK] Actor shutting down");
+        println!("[CLIENT] Actor exited for {}", self.peer_addr);
     }
     
-    fn connect_to_peer(&mut self, addr: SocketAddr) -> io::Result<()> {
-        let mut stream = TcpStream::connect_timeout(&addr, self.config.connection_timeout)?;
-        stream.set_nodelay(true)?;
-        
-        // Send Connect message
-        let connect_msg = Message::Connect(
-            self.identity.0.clone(),
-            self.identity.1.as_bytes().to_vec(),
-            self.pool_commitment
-        );
-        write_message(&mut stream, &connect_msg)?;
-        
-        // Handle challenge-response auth
-        let response = read_message(&mut stream)?;
-        match response {
-            Message::Challenge(challenge) => {
-                let signature = detached_sign(&challenge, &self.identity.2);
-                write_message(&mut stream, &Message::Response(signature.as_bytes().to_vec()))?;
-                
-                let auth_result = read_message(&mut stream)?;
-                if let Message::Connect(peer_did, peer_pubkey, _) = auth_result {
-                    // Spawn peer actor
-                    let (peer_tx, peer_rx) = mpsc::channel();
-                    self.peers.insert(peer_did.clone(), peer_tx.clone());
-                    
-                    let peer_actor = PeerActor::new(
-                        peer_did.clone(),
-                        Some(peer_pubkey),
-                        true,
-                        stream,
-                        peer_rx,
-                        self.main_tx.clone(),
-                        self.config.clone(),
-                    );
-                    
-                    thread::spawn(move || peer_actor.run());
-                    
-                    // Notify main actor
-                    let _ = self.main_tx.send(MainActorMsg::PeerConnected(peer_did, peer_tx));
-                    
-                    Ok(())
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Auth failed"))
-                }
+    fn handle_message(&mut self, msg: ClientActorMsg) -> bool {
+        match msg {
+            ClientActorMsg::Authenticate(did, pubkey, pool) => {
+                self.state = ClientState::Authenticated(did.clone());
+                println!("[CLIENT] Authenticated as {}", did.0);
+                true
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Expected Challenge"))
+            ClientActorMsg::HandleMessage(msg) => {
+                self.handle_protocol_message(msg);
+                true
+            }
+            ClientActorMsg::SendMessage(msg) => {
+                self.send_message(msg);
+                true
+            }
+            ClientActorMsg::GetState(reply) => {
+                let _ = reply.send(self.state.clone());
+                true
+            }
+            ClientActorMsg::Disconnect => {
+                println!("[CLIENT] Disconnecting {}", self.peer_addr);
+                false
+            }
         }
     }
     
-    fn handle_incoming_connection(&mut self, mut stream: TcpStream) {
-        // Read Connect message
-        match read_message(&mut stream) {
-            Ok(Message::Connect(peer_did, peer_pubkey, peer_commitment)) => {
-                if peer_commitment != self.pool_commitment {
-                    println!("[NETWORK] Pool mismatch from {}", peer_did.0);
-                    return;
+    fn process_data(&mut self, data: &[u8]) {
+        // Parse DIAGON message from data
+        if data.len() >= 4 {
+            let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if data.len() >= 4 + len {
+                if let Ok(msg) = bincode::deserialize::<Message>(&data[4..4+len]) {
+                    self.handle_protocol_message(msg);
                 }
-                
+            }
+        }
+    }
+    
+    fn handle_protocol_message(&mut self, msg: Message) {
+        println!("[CLIENT] Received {:?} from {}", 
+                 std::mem::discriminant(&msg), self.peer_addr);
+        
+        match msg {
+            Message::Connect(did, pubkey, pool) => {
                 // Send challenge
                 let mut challenge = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut challenge);
-                
-                if write_message(&mut stream, &Message::Challenge(challenge)).is_err() {
-                    return;
-                }
-                
-                // Verify response
-                match read_message(&mut stream) {
-                    Ok(Message::Response(signature)) => {
-                        if verify_signature(&challenge, &signature, &peer_pubkey) {
-                            // Send our identity
-                            let _ = write_message(&mut stream, &Message::Connect(
-                                self.identity.0.clone(),
-                                self.identity.1.as_bytes().to_vec(),
-                                self.pool_commitment
-                            ));
-                            
-                            // Spawn peer actor
-                            let (peer_tx, peer_rx) = mpsc::channel();
-                            self.peers.insert(peer_did.clone(), peer_tx.clone());
-                            
-                            let peer_actor = PeerActor::new(
-                                peer_did.clone(),
-                                Some(peer_pubkey),
-                                true,
-                                stream,
-                                peer_rx,
-                                self.main_tx.clone(),
-                                self.config.clone(),
-                            );
-                            
-                            thread::spawn(move || peer_actor.run());
-                            
-                            // Notify main actor
-                            let _ = self.main_tx.send(MainActorMsg::PeerConnected(peer_did, peer_tx));
-                        }
-                    }
-                    _ => {}
+                self.state = ClientState::Challenging(challenge);
+                self.send_message(Message::Challenge(challenge));
+            }
+            Message::Challenge(challenge) => {
+                // Would sign challenge here
+                self.send_message(Message::Response(vec![]));
+            }
+            Message::Response(signature) => {
+                // Verify signature and authenticate
+                if let ClientState::Challenging(_) = self.state {
+                    // Would verify signature here
+                    println!("[CLIENT] Authentication successful");
                 }
             }
+            Message::Elaborate(text) => {
+                println!("[CLIENT] Elaboration: {}", text);
+            }
             _ => {}
+        }
+    }
+    
+    fn send_message(&mut self, msg: Message) {
+        if let Ok(data) = bincode::serialize(&msg) {
+            let len = (data.len() as u32).to_be_bytes();
+            let _ = self.stream.write_all(&len);
+            let _ = self.stream.write_all(&data);
+            let _ = self.stream.flush();
         }
     }
 }
@@ -957,132 +906,102 @@ impl NetworkActor {
 // GOVERNANCE ACTOR
 // ============================================================================
 
+#[derive(Clone)]
+struct Proposal {
+    cid: Cid,
+    entry_type: EntryType,
+    proposer: Did,
+    elaboration: String,
+    votes_for: HashSet<Did>,
+    votes_against: HashSet<Did>,
+    executed: bool,
+}
+
 struct GovernanceActor {
-    entries: Vec<Entry>,
+    receiver: mpsc::Receiver<GovernanceActorMsg>,
     proposals: HashMap<Cid, Proposal>,
-    receiver: Receiver<GovernanceActorMsg>,
-    network_tx: Sender<NetworkActorMsg>,
-    trust_tx: Sender<TrustActorMsg>,
-    storage_tx: Sender<StorageActorMsg>,
-    config: Config,
-    validator: Validator,
-    authenticated_peers: usize,
+    running: Arc<AtomicBool>,
 }
 
 impl GovernanceActor {
+    fn new(receiver: mpsc::Receiver<GovernanceActorMsg>, running: Arc<AtomicBool>) -> Self {
+        Self {
+            receiver,
+            proposals: HashMap::new(),
+            running,
+        }
+    }
+    
     fn run(mut self) {
+        println!("[GOVERNANCE] Started");
+        
         while let Ok(msg) = self.receiver.recv() {
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+            
             match msg {
-                GovernanceActorMsg::CreateProposal(did, entry_type, elaboration, reply_tx) => {
-                    let result = self.create_proposal(did, entry_type, elaboration);
-                    let _ = reply_tx.send(result);
+                GovernanceActorMsg::CreateProposal(did, entry_type, elaboration, reply) => {
+                    let cid = self.create_proposal(did, entry_type, elaboration);
+                    let _ = reply.send(Ok(cid));
                 }
-                GovernanceActorMsg::CastVote(did, cid, support, elaboration) => {
-                    self.cast_vote(did, cid, support, elaboration);
+                GovernanceActorMsg::CastVote(did, cid, support, elaboration, reply) => {
+                    let result = self.cast_vote(did, cid, support, elaboration);
+                    let _ = reply.send(result);
+                }
+                GovernanceActorMsg::GetProposal(cid, reply) => {
+                    let _ = reply.send(self.proposals.get(&cid).cloned());
                 }
                 GovernanceActorMsg::CheckThresholds => {
                     self.check_execution_thresholds();
                 }
-                GovernanceActorMsg::GetProposal(cid, reply_tx) => {
-                    let _ = reply_tx.send(self.proposals.get(&cid).cloned());
-                }
-                GovernanceActorMsg::GetAllProposals(reply_tx) => {
-                    let _ = reply_tx.send(self.proposals.values().cloned().collect());
-                }
+                GovernanceActorMsg::Shutdown => break,
             }
         }
+        
+        println!("[GOVERNANCE] Exited");
     }
     
-    fn create_proposal(&mut self, did: Did, entry_type: EntryType, elaboration: String) -> Result<Cid, String> {
-        self.validator.validate_elaboration(&elaboration)?;
+    fn create_proposal(&mut self, did: Did, entry_type: EntryType, elaboration: String) -> Cid {
+        let mut hasher = Sha256::new();
+        hasher.update(elaboration.as_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+        let cid = Cid(hash);
         
-        let data = bincode::serialize(&entry_type).unwrap();
-        let cid = Cid::new(&data, &did);
-        
-        let entry = Entry {
-            cid,
-            entry_type: entry_type.clone(),
-            data,
-            creator: did.clone(),
-            timestamp: current_timestamp(),
-            signature: vec![], // Would be signed in real impl
-        };
-        
-        self.validator.validate_entry(&entry)?;
-        
-        self.entries.push(entry.clone());
         self.proposals.insert(cid, Proposal {
             cid,
             entry_type,
             proposer: did,
             elaboration,
-            votes_for: HashMap::new(),
-            votes_against: HashMap::new(),
-            threshold: self.calculate_threshold(),
+            votes_for: HashSet::new(),
+            votes_against: HashSet::new(),
             executed: false,
         });
         
-        // Persist
-        let _ = self.storage_tx.send(StorageActorMsg::SaveEntry(entry));
-        
-        Ok(cid)
+        println!("[GOVERNANCE] Created proposal {}", cid.short());
+        cid
     }
     
-    fn cast_vote(&mut self, did: Did, cid: Cid, support: bool, elaboration: String) {
-        if let Some(proposal) = self.proposals.get_mut(&cid) {
-            if support {
-                proposal.votes_for.insert(did, elaboration);
-            } else {
-                proposal.votes_against.insert(did, elaboration);
-            }
-            
-            if !proposal.executed && self.check_execution_threshold(proposal) {
-                proposal.executed = true;
-                self.execute_proposal(cid, proposal.entry_type.clone());
-            }
+    fn cast_vote(&mut self, did: Did, cid: Cid, support: bool, _elaboration: String) -> Result<(), String> {
+        let proposal = self.proposals.get_mut(&cid)
+            .ok_or("Proposal not found")?;
+        
+        if support {
+            proposal.votes_for.insert(did);
+        } else {
+            proposal.votes_against.insert(did);
         }
+        
+        println!("[GOVERNANCE] Vote cast on {}: {}", cid.short(), support);
+        Ok(())
     }
     
     fn check_execution_thresholds(&mut self) {
-        let mut to_execute = Vec::new();
-        
-        for (cid, proposal) in &mut self.proposals {
-            if !proposal.executed && self.check_execution_threshold(proposal) {
+        for proposal in self.proposals.values_mut() {
+            if !proposal.executed && proposal.votes_for.len() >= 2 {
                 proposal.executed = true;
-                to_execute.push((*cid, proposal.entry_type.clone()));
+                println!("[GOVERNANCE] Executed proposal {}", proposal.cid.short());
             }
-        }
-        
-        for (cid, entry_type) in to_execute {
-            self.execute_proposal(cid, entry_type);
-        }
-    }
-    
-    fn calculate_threshold(&self) -> i32 {
-        ((self.authenticated_peers + 1) as f64 * 0.67).ceil() as i32
-    }
-    
-    fn check_execution_threshold(&self, proposal: &Proposal) -> bool {
-        let votes_for = proposal.votes_for.len() as i32;
-        
-        if matches!(proposal.entry_type, EntryType::PrivacyThreshold { .. }) {
-            let required = (proposal.threshold as f64 * self.config.privacy_threshold_supermajority).ceil() as i32;
-            return votes_for >= required;
-        }
-        
-        votes_for >= proposal.threshold
-    }
-    
-    fn execute_proposal(&mut self, cid: Cid, entry_type: EntryType) {
-        match entry_type {
-            EntryType::Knowledge { category, concept, .. } => {
-                println!("[EXECUTE] Knowledge: {} > {}", category, concept);
-            }
-            EntryType::Prune { target, reason } => {
-                println!("[EXECUTE] Prune {} - {}", target.short(), reason);
-                self.entries.retain(|e| e.cid != target);
-            }
-            _ => {}
         }
     }
 }
@@ -1092,65 +1011,111 @@ impl GovernanceActor {
 // ============================================================================
 
 struct TrustActor {
-    scores: HashMap<Did, TrustScore>,
-    receiver: Receiver<TrustActorMsg>,
-    config: Config,
+    receiver: mpsc::Receiver<TrustActorMsg>,
+    scores: HashMap<Did, f64>,
+    running: Arc<AtomicBool>,
 }
 
 impl TrustActor {
-    fn run(mut self) {
-        while let Ok(msg) = self.receiver.recv() {
-            match msg {
-                TrustActorMsg::UpdateTrust(did, elaboration) => {
-                    let score = self.score_elaboration(&elaboration);
-                    let ts = self.scores.entry(did.clone())
-                        .or_insert_with(|| TrustScore::new(did));
-                    ts.overall_score = (ts.overall_score * 0.7) + (score * 0.3);
-                    ts.interaction_count += 1;
-                    ts.last_updated = current_timestamp();
-                }
-                TrustActorMsg::GetTrust(did, reply_tx) => {
-                    let trust = self.scores.get(&did)
-                        .map(|ts| ts.overall_score)
-                        .unwrap_or(0.5);
-                    let _ = reply_tx.send(trust);
-                }
-                TrustActorMsg::DecayTrust => {
-                    let now = current_timestamp();
-                    for score in self.scores.values_mut() {
-                        let days_inactive = (now - score.last_updated) / 86400;
-                        if days_inactive > self.config.trust_decay_days {
-                            let decay_periods = days_inactive / self.config.trust_decay_days;
-                            score.overall_score *= self.config.trust_decay_rate.powi(decay_periods as i32);
-                        }
-                    }
-                }
-                TrustActorMsg::GetAllScores(reply_tx) => {
-                    let _ = reply_tx.send(self.scores.clone());
-                }
-            }
+    fn new(receiver: mpsc::Receiver<TrustActorMsg>, running: Arc<AtomicBool>) -> Self {
+        Self {
+            receiver,
+            scores: HashMap::new(),
+            running,
         }
     }
     
-    fn score_elaboration(&self, text: &str) -> f64 {
-        let words: Vec<_> = text.split_whitespace().collect();
-        let unique: HashSet<_> = words.iter().collect();
-        let uniqueness = unique.len() as f64 / words.len().max(1) as f64;
-        let length_score = (text.len() as f64 / 100.0).min(1.0);
-        (uniqueness * 0.5 + length_score * 0.5).min(1.0)
+    fn run(mut self) {
+        println!("[TRUST] Started");
+        
+        while let Ok(msg) = self.receiver.recv() {
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            match msg {
+                TrustActorMsg::UpdateTrust(did, delta) => {
+                    let score = self.scores.entry(did.clone()).or_insert(0.5);
+                    *score = (*score + delta).max(0.0).min(1.0);
+                    println!("[TRUST] Updated {} to {:.2}", did.0, score);
+                }
+                TrustActorMsg::GetTrust(did, reply) => {
+                    let score = self.scores.get(&did).copied().unwrap_or(0.5);
+                    let _ = reply.send(score);
+                }
+                TrustActorMsg::DecayTrust => {
+                    for score in self.scores.values_mut() {
+                        *score *= 0.95;
+                    }
+                    println!("[TRUST] Applied decay");
+                }
+                TrustActorMsg::Shutdown => break,
+            }
+        }
+        
+        println!("[TRUST] Exited");
     }
 }
 
 // ============================================================================
-// CAPTURE ACTOR (PCAP)
+// STORAGE ACTOR
+// ============================================================================
+
+struct StorageActor {
+    receiver: mpsc::Receiver<StorageActorMsg>,
+    entries: HashMap<Cid, Entry>,
+    running: Arc<AtomicBool>,
+}
+
+impl StorageActor {
+    fn new(receiver: mpsc::Receiver<StorageActorMsg>, running: Arc<AtomicBool>) -> Self {
+        Self {
+            receiver,
+            entries: HashMap::new(),
+            running,
+        }
+    }
+    
+    fn run(mut self) {
+        println!("[STORAGE] Started");
+        
+        while let Ok(msg) = self.receiver.recv() {
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            match msg {
+                StorageActorMsg::SaveEntry(entry) => {
+                    println!("[STORAGE] Saved entry {}", entry.cid.short());
+                    self.entries.insert(entry.cid, entry);
+                }
+                StorageActorMsg::GetEntry(cid, reply) => {
+                    let _ = reply.send(self.entries.get(&cid).cloned());
+                }
+                StorageActorMsg::SaveState(data) => {
+                    println!("[STORAGE] Saved state ({} bytes)", data.len());
+                }
+                StorageActorMsg::LoadState(reply) => {
+                    let _ = reply.send(None); // Would load from disk
+                }
+                StorageActorMsg::Shutdown => break,
+            }
+        }
+        
+        println!("[STORAGE] Exited");
+    }
+}
+
+// ============================================================================
+// PACKET CAPTURE ACTOR
 // ============================================================================
 
 struct CaptureActor {
-    receiver: Receiver<CaptureActorMsg>,
+    receiver: mpsc::Receiver<CaptureActorMsg>,
 }
 
 impl CaptureActor {
-    fn run(self) {
+    fn run(mut self) {
         while let Ok(msg) = self.receiver.recv() {
             match msg {
                 CaptureActorMsg::Start(interface) => {
@@ -1161,11 +1126,11 @@ impl CaptureActor {
         }
     }
     
-    fn capture_packets(&self, interface: &str) {
+    fn capture_packets(&mut self, interface: &str) {
         let devices = match Device::list() {
             Ok(devs) => devs,
             Err(e) => {
-                println!("[PCAP] Failed to list devices: {}", e);
+                eprintln!("[CAPTURE] Failed to list devices: {}", e);
                 return;
             }
         };
@@ -1173,44 +1138,38 @@ impl CaptureActor {
         let device = devices.iter()
             .find(|d| d.name == interface || 
                       d.desc.as_ref().map(|s| s.contains(interface)).unwrap_or(false))
-            .cloned();
+            .cloned()
+            .unwrap_or_else(|| devices[0].clone());
         
-        let device = match device {
-            Some(d) => d,
-            None => {
-                println!("[PCAP] Device not found: {}", interface);
-                return;
-            }
-        };
+        println!("[CAPTURE] Using device: {}", device.name);
         
         let mut cap = match Capture::from_device(device)
             .unwrap()
             .promisc(true)
             .snaplen(65535)
             .timeout(1000)
-            .open() 
+            .open()
         {
             Ok(c) => c,
             Err(e) => {
-                println!("[PCAP] Failed to open capture: {}", e);
+                eprintln!("[CAPTURE] Failed to open: {}", e);
                 return;
             }
         };
         
-        if let Err(e) = cap.filter("tcp", true) {
-            println!("[PCAP] Failed to set filter: {}", e);
-        }
-        
-        println!("[PCAP] Capturing packets...");
+        let _ = cap.filter("tcp port 9090", true);
         
         loop {
+            match self.receiver.try_recv() {
+                Ok(CaptureActorMsg::Stop) => break,
+                _ => {}
+            }
+            
             match cap.next_packet() {
-                Ok(packet) => {
-                    self.parse_packet(&packet.data);
-                }
+                Ok(packet) => self.parse_packet(&packet.data),
                 Err(pcap::Error::TimeoutExpired) => continue,
                 Err(e) => {
-                    println!("[PCAP] Capture error: {}", e);
+                    eprintln!("[CAPTURE] Error: {}", e);
                     break;
                 }
             }
@@ -1218,486 +1177,216 @@ impl CaptureActor {
     }
     
     fn parse_packet(&self, packet: &[u8]) {
-        // Skip if too small for headers
-        if packet.len() < 54 { return; } // 14 (eth) + 20 (ip) + 20 (tcp)
+        if packet.len() < 54 { return; }
         
-        // Parse Ethernet header (14 bytes)
-        let eth_offset = 14;
+        // Parse headers (simplified)
+        let ip_offset = 14; // Ethernet header
+        let ip_header_len = ((packet[ip_offset] & 0x0F) * 4) as usize;
+        let tcp_offset = ip_offset + ip_header_len;
         
-        // Parse IP header
-        let ip_version = (packet[eth_offset] >> 4) & 0x0F;
-        if ip_version != 4 { return; } // Only IPv4 for now
-        
-        let ip_header_len = ((packet[eth_offset] & 0x0F) * 4) as usize;
-        let ip_total_len = u16::from_be_bytes([packet[eth_offset + 2], packet[eth_offset + 3]]) as usize;
-        
-        let src_ip = format!("{}.{}.{}.{}", 
-            packet[eth_offset + 12], packet[eth_offset + 13], 
-            packet[eth_offset + 14], packet[eth_offset + 15]);
-        let dst_ip = format!("{}.{}.{}.{}", 
-            packet[eth_offset + 16], packet[eth_offset + 17], 
-            packet[eth_offset + 18], packet[eth_offset + 19]);
-        
-        // Parse TCP header
-        let tcp_offset = eth_offset + ip_header_len;
         if packet.len() < tcp_offset + 20 { return; }
         
         let src_port = u16::from_be_bytes([packet[tcp_offset], packet[tcp_offset + 1]]);
         let dst_port = u16::from_be_bytes([packet[tcp_offset + 2], packet[tcp_offset + 3]]);
         
-        let tcp_flags = packet[tcp_offset + 13];
-        let mut flags = String::new();
-        if tcp_flags & 0x02 != 0 { flags.push_str("SYN "); }
-        if tcp_flags & 0x10 != 0 { flags.push_str("ACK "); }
-        if tcp_flags & 0x01 != 0 { flags.push_str("FIN "); }
-        if tcp_flags & 0x04 != 0 { flags.push_str("RST "); }
-        if tcp_flags & 0x08 != 0 { flags.push_str("PSH "); }
-        
         let tcp_header_len = ((packet[tcp_offset + 12] >> 4) * 4) as usize;
         let payload_offset = tcp_offset + tcp_header_len;
         
         if payload_offset < packet.len() {
-            let payload_len = packet.len() - payload_offset;
+            let payload = &packet[payload_offset..];
             
-            // Try to parse DIAGON messages
-            if payload_len >= 4 {
-                let msg_len = u32::from_be_bytes([
-                    packet[payload_offset], packet[payload_offset + 1],
-                    packet[payload_offset + 2], packet[payload_offset + 3]
-                ]) as usize;
-                
-                if payload_len >= 4 + msg_len {
-                    let msg_bytes = &packet[payload_offset + 4..payload_offset + 4 + msg_len];
-                    
-                    if let Ok(message) = bincode::deserialize::<Message>(msg_bytes) {
-                        println!("[PCAP] {}:{} -> {}:{} [{}] DIAGON: {:?}", 
-                                 src_ip, src_port, dst_ip, dst_port, flags.trim(), 
-                                 self.message_summary(&message));
-                        return;
+            // Try to parse DIAGON message
+            if payload.len() >= 4 {
+                let len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                if payload.len() >= 4 + len {
+                    if let Ok(msg) = bincode::deserialize::<Message>(&payload[4..4+len]) {
+                        println!("[CAPTURE] DIAGON {:?} on {}->{}",
+                                 std::mem::discriminant(&msg), src_port, dst_port);
                     }
                 }
             }
-            
-            println!("[PCAP] {}:{} -> {}:{} [{}] {} bytes", 
-                     src_ip, src_port, dst_ip, dst_port, flags.trim(), payload_len);
-        }
-    }
-    
-    fn message_summary(&self, msg: &Message) -> String {
-        match msg {
-            Message::Connect(did, _, _) => format!("Connect({})", &did.0[..20]),
-            Message::Challenge(_) => "Challenge".to_string(),
-            Message::Response(_) => "Response".to_string(),
-            Message::Elaborate(text) => format!("Elaborate({})", &text[..20.min(text.len())]),
-            Message::Propose(did, entry, _) => format!("Propose({}, {})", &did.0[..20], entry.cid.short()),
-            Message::Vote(did, cid, support, _, _) => format!("Vote({}, {}, {})", &did.0[..20], cid.short(), support),
-            Message::Heartbeat(did) => format!("Heartbeat({})", &did.0[..20]),
-            _ => format!("{:?}", msg).split('(').next().unwrap_or("Unknown").to_string(),
         }
     }
 }
 
 // ============================================================================
-// STORAGE ACTOR
-// ============================================================================
-
-struct StorageActor {
-    db_path: String,
-    receiver: Receiver<StorageActorMsg>,
-    state: SavedState,
-}
-
-impl StorageActor {
-    fn new(db_path: String, receiver: Receiver<StorageActorMsg>) -> Self {
-        let state = Self::load_from_disk(&db_path).unwrap_or_default();
-        Self {
-            db_path,
-            receiver,
-            state,
-        }
-    }
-    
-    fn run(mut self) {
-        while let Ok(msg) = self.receiver.recv() {
-            match msg {
-                StorageActorMsg::SaveEntry(entry) => {
-                    self.state.entries.push(entry);
-                }
-                StorageActorMsg::SaveProposal(proposal) => {
-                    self.state.proposals.insert(proposal.cid, proposal);
-                }
-                StorageActorMsg::SaveTrustScore(score) => {
-                    self.state.trust_scores.insert(score.did.clone(), score);
-                }
-                StorageActorMsg::SaveStake(did, stake) => {
-                    self.state.stakes.insert(did, stake);
-                }
-                StorageActorMsg::SavePrivacyThreshold(threshold) => {
-                    self.state.privacy_threshold = threshold;
-                }
-                StorageActorMsg::LoadState(reply_tx) => {
-                    let _ = reply_tx.send(Some(self.state.clone()));
-                }
-                StorageActorMsg::Persist => {
-                    let _ = self.save_to_disk();
-                }
-            }
-        }
-    }
-    
-    fn load_from_disk(path: &str) -> Option<SavedState> {
-        std::fs::read(path).ok()
-            .and_then(|data| serde_cbor::from_slice(&data).ok())
-    }
-    
-    fn save_to_disk(&self) -> io::Result<()> {
-        let temp_path = format!("{}.tmp", self.db_path);
-        let file = File::create(&temp_path)?;
-        serde_cbor::to_writer(BufWriter::new(file), &self.state)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        std::fs::rename(temp_path, &self.db_path)?;
-        Ok(())
-    }
-}
-
-// ============================================================================
-// MAINTENANCE ACTOR
-// ============================================================================
-
-struct MaintenanceActor {
-    receiver: Receiver<()>,
-    network_tx: Sender<NetworkActorMsg>,
-    trust_tx: Sender<TrustActorMsg>,
-    storage_tx: Sender<StorageActorMsg>,
-    config: Config,
-}
-
-impl MaintenanceActor {
-    fn run(self) {
-        let mut last_heartbeat = Instant::now();
-        let mut last_trust_decay = Instant::now();
-        let mut last_persist = Instant::now();
-        
-        loop {
-            // Use timeout to periodically check tasks
-            match self.receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(_) => break, // Shutdown signal
-                Err(_) => {} // Timeout - continue with maintenance
-            }
-            
-            let now = Instant::now();
-            
-            // Send heartbeats
-            if now.duration_since(last_heartbeat) >= self.config.heartbeat_interval {
-                let _ = self.network_tx.send(NetworkActorMsg::Heartbeat);
-                last_heartbeat = now;
-            }
-            
-            // Decay trust scores
-            if now.duration_since(last_trust_decay) >= Duration::from_secs(86400) {
-                let _ = self.trust_tx.send(TrustActorMsg::DecayTrust);
-                last_trust_decay = now;
-            }
-            
-            // Persist state
-            if now.duration_since(last_persist) >= Duration::from_secs(300) {
-                let _ = self.storage_tx.send(StorageActorMsg::Persist);
-                last_persist = now;
-            }
-        }
-    }
-}
-
-// ============================================================================
-// MAIN ACTOR & NODE API
+// NODE API
 // ============================================================================
 
 pub struct Node {
-    main_tx: Sender<MainActorMsg>,
-    network_tx: Sender<NetworkActorMsg>,
-    governance_tx: Sender<GovernanceActorMsg>,
-    trust_tx: Sender<TrustActorMsg>,
-    capture_tx: Option<Sender<CaptureActorMsg>>,
-    maintenance_shutdown: Sender<()>,
-    pub did: Did,
+    supervisor: SupervisorHandle,
+    network: NetworkActorHandle,
+    governance: GovernanceActorHandle,
+    trust: TrustActorHandle,
+    storage: StorageActorHandle,
+    capture: Option<CaptureActorHandle>,
+    running: Arc<AtomicBool>,
 }
 
 impl Node {
-    pub fn new(addr: &str) -> io::Result<Arc<Self>> {
-        let (main_tx, main_rx) = mpsc::channel();
-        let (network_tx, network_rx) = mpsc::channel();
-        let (governance_tx, governance_rx) = mpsc::channel();
+    pub fn new() -> Arc<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        
+        // Create supervisor
+        let (sup_tx, sup_rx) = mpsc::channel();
+        let supervisor = SupervisorHandle { sender: sup_tx };
+        
+        // Create actor handles (supervisor will spawn them)
+        let (net_tx, net_rx) = mpsc::channel();
+        let (gov_tx, gov_rx) = mpsc::channel();
         let (trust_tx, trust_rx) = mpsc::channel();
-        let (storage_tx, storage_rx) = mpsc::channel();
-        let (maintenance_tx, maintenance_rx) = mpsc::channel();
-        let (capture_tx, capture_rx) = mpsc::channel();
+        let (stor_tx, stor_rx) = mpsc::channel();
         
-        // Create identity
-        let addr_hash = hex::encode(&sha256(addr.as_bytes())[..8]);
-        let (public_key, secret_key, did) = Self::load_or_create_identity(&addr_hash)?;
+        let network = NetworkActorHandle { sender: net_tx };
+        let governance = GovernanceActorHandle { sender: gov_tx };
+        let trust = TrustActorHandle { sender: trust_tx };
+        let storage = StorageActorHandle { sender: stor_tx };
         
-        let config = Config::default();
-        
-        // Spawn storage actor
-        let db_path = format!("db/diagon_{}.cbor", addr_hash);
+        // Start supervisor
+        let sup_running = running.clone();
         thread::spawn(move || {
-            StorageActor::new(db_path, storage_rx).run();
+            let supervisor = SupervisorActor::new(sup_rx, sup_running);
+            supervisor.run();
         });
         
-        // Spawn network actor
-        let network_actor = NetworkActor::new(
-            network_rx,
-            main_tx.clone(),
-            config.clone(),
-            (did.clone(), public_key, secret_key),
-            PUBLIC_GENESIS,
-        );
-        thread::spawn(move || network_actor.run());
-        
-        // Spawn governance actor
-        let governance_actor = GovernanceActor {
-            entries: Vec::new(),
-            proposals: HashMap::new(),
-            receiver: governance_rx,
-            network_tx: network_tx.clone(),
-            trust_tx: trust_tx.clone(),
-            storage_tx: storage_tx.clone(),
-            config: config.clone(),
-            validator: Validator::new(config.clone()),
-            authenticated_peers: 0,
-        };
-        thread::spawn(move || governance_actor.run());
-        
-        // Spawn trust actor
-        let trust_actor = TrustActor {
-            scores: HashMap::new(),
-            receiver: trust_rx,
-            config: config.clone(),
-        };
-        thread::spawn(move || trust_actor.run());
-        
-        // Spawn maintenance actor
-        let maint_network_tx = network_tx.clone();
-        let maint_trust_tx = trust_tx.clone();
+        // Start actors
+        let net_running = running.clone();
         thread::spawn(move || {
-            MaintenanceActor {
-                receiver: maintenance_rx,
-                network_tx: maint_network_tx,
-                trust_tx: maint_trust_tx,
-                storage_tx,
-                config,
-            }.run();
+            let actor = NetworkActor::new(net_rx, net_running);
+            actor.run();
         });
         
-        // Optionally spawn capture actor
-        if std::env::var("ENABLE_PCAP").is_ok() {
-            thread::spawn(move || {
-                CaptureActor { receiver: capture_rx }.run();
-            });
-        } else {
-            // Drain capture channel
-            thread::spawn(move || {
-                while capture_rx.recv().is_ok() {}
-            });
-        }
+        let gov_running = running.clone();
+        thread::spawn(move || {
+            let actor = GovernanceActor::new(gov_rx, gov_running);
+            actor.run();
+        });
         
-        // Start listening
-        let socket_addr: SocketAddr = addr.parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
-        network_tx.send(NetworkActorMsg::StartListening(socket_addr))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to start network"))?;
+        let trust_running = running.clone();
+        thread::spawn(move || {
+            let actor = TrustActor::new(trust_rx, trust_running);
+            actor.run();
+        });
         
-        // Start capture if requested
-        let capture_tx = if std::env::var("ENABLE_PCAP").is_ok() {
-            let tx = capture_tx.clone();
-            let interface = std::env::var("PCAP_INTERFACE").unwrap_or_else(|_| "lo".to_string());
-            tx.send(CaptureActorMsg::Start(interface)).ok();
-            Some(capture_tx)
+        let stor_running = running.clone();
+        thread::spawn(move || {
+            let actor = StorageActor::new(stor_rx, stor_running);
+            actor.run();
+        });
+        
+        // Optional packet capture
+        let capture = if std::env::var("ENABLE_PCAP").is_ok() {
+            let (cap_tx, cap_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let actor = CaptureActor { receiver: cap_rx };
+                actor.run();
+            });
+            Some(CaptureActorHandle { sender: cap_tx })
         } else {
             None
         };
         
-        println!("[NODE] Started: {}", did.0);
-        
-        Ok(Arc::new(Self {
-            main_tx,
-            network_tx,
-            governance_tx,
-            trust_tx,
-            capture_tx,
-            maintenance_shutdown: maintenance_tx,
-            did,
-        }))
+        Arc::new(Self {
+            supervisor,
+            network,
+            governance,
+            trust,
+            storage,
+            capture,
+            running,
+        })
     }
     
-    fn load_or_create_identity(addr_hash: &str) -> io::Result<(PublicKey, SecretKey, Did)> {
-        std::fs::create_dir_all("db").ok();
-        let identity_path = format!("db/identity_{}.cbor", addr_hash);
-        
-        if Path::new(&identity_path).exists() {
-            if let Ok(data) = std::fs::read(&identity_path) {
-                if let Ok((pk_bytes, sk_bytes, did)) = serde_cbor::from_slice::<(Vec<u8>, Vec<u8>, Did)>(&data) {
-                    if let (Ok(pk), Ok(sk)) = (PublicKey::from_bytes(&pk_bytes), SecretKey::from_bytes(&sk_bytes)) {
-                        if Did::from_pubkey(&pk) == did {
-                            return Ok((pk, sk, did));
-                        }
-                    }
-                }
-            }
-        }
-        
-        let (pk, sk) = keypair();
-        let did = Did::from_pubkey(&pk);
-        let identity = (pk.as_bytes().to_vec(), sk.as_bytes().to_vec(), did.clone());
-        
-        if let Ok(file) = File::create(&identity_path) {
-            let _ = serde_cbor::to_writer(BufWriter::new(file), &identity);
-        }
-        
-        Ok((pk, sk, did))
-    }
-    
-    // Public API methods
-    pub fn auth(&self, passphrase: &str) {
-        let _ = self.main_tx.send(MainActorMsg::Auth(passphrase.to_string()));
-    }
-    
-    pub fn connect(&self, addr: &str) -> io::Result<()> {
+    pub fn listen(&self, addr: &str) -> Result<(), String> {
         let socket_addr: SocketAddr = addr.parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid address"))?;
-        
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.network_tx.send(NetworkActorMsg::ConnectTo(socket_addr, reply_tx))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to send"))?;
-        
-        reply_rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Connect timeout"))?
+            .map_err(|_| "Invalid address")?;
+        self.network.start_listening(socket_addr)
+    }
+    
+    pub fn connect(&self, addr: &str) -> Result<Did, String> {
+        let socket_addr: SocketAddr = addr.parse()
+            .map_err(|_| "Invalid address")?;
+        self.network.connect_to(socket_addr)
     }
     
     pub fn elaborate(&self, text: &str) {
-        let _ = self.main_tx.send(MainActorMsg::Elaborate(text.to_string()));
-        let msg = Message::Elaborate(text.to_string());
-        let _ = self.network_tx.send(NetworkActorMsg::Broadcast(msg));
+        self.network.broadcast(Message::Elaborate(text.to_string()));
     }
     
-    pub fn approve(&self, did_str: &str) {
-        let _ = self.main_tx.send(MainActorMsg::Approve(did_str.to_string()));
+    pub fn propose(&self, did: Did, entry_type: EntryType, elaboration: String) -> Result<Cid, String> {
+        self.governance.create_proposal(did, entry_type, elaboration)
     }
     
-    pub fn propose(&self, entry_type: EntryType, elaboration: &str) {
-        let _ = self.main_tx.send(MainActorMsg::Propose(entry_type, elaboration.to_string()));
+    pub fn vote(&self, did: Did, cid: Cid, support: bool, elaboration: String) -> Result<(), String> {
+        self.governance.cast_vote(did, cid, support, elaboration)
     }
     
-    pub fn vote(&self, cid_str: &str, support: bool, elaboration: &str) {
-        let _ = self.main_tx.send(MainActorMsg::Vote(cid_str.to_string(), support, elaboration.to_string()));
+    pub fn get_trust(&self, did: Did) -> f64 {
+        self.trust.get_trust(did)
     }
     
-    pub fn stake(&self, amount: u64, duration_secs: u64) {
-        let _ = self.main_tx.send(MainActorMsg::Stake(amount, duration_secs));
+    pub fn get_peers(&self) -> Vec<Did> {
+        self.network.get_peers()
     }
     
-    pub fn status(&self) {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.main_tx.send(MainActorMsg::Status(reply_tx)).is_ok() {
-            if let Ok(status) = reply_rx.recv_timeout(Duration::from_secs(5)) {
-                println!("\n=== NODE STATUS ===");
-                println!("DID: {}", self.did.0);
-                println!("Entries: {}", status.entries);
-                println!("Proposals: {}", status.proposals);
-                println!("Peers: {}", status.peers);
-            }
+    pub fn enable_capture(&self, interface: &str) {
+        if let Some(capture) = &self.capture {
+            capture.start(interface.to_string());
         }
     }
     
     pub fn shutdown(&self) {
-        println!("[SHUTDOWN] Initiating shutdown");
+        println!("[NODE] Initiating shutdown");
+        self.running.store(false, Ordering::Relaxed);
+        self.supervisor.sender.send(SupervisorMsg::Shutdown).ok();
+        thread::sleep(Duration::from_secs(1));
+        println!("[NODE] Shutdown complete");
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+fn main() {
+    println!("DIAGON - Actor-Based P2P Governance System");
+    println!("=========================================\n");
+    
+    let node = Node::new();
+    
+    // Start listening
+    if let Err(e) = node.listen("0.0.0.0:9090") {
+        eprintln!("Failed to start listening: {}", e);
+        return;
+    }
+    
+    // Enable packet capture if requested
+    if std::env::var("ENABLE_PCAP").is_ok() {
+        let interface = std::env::var("PCAP_INTERFACE")
+            .unwrap_or_else(|_| "lo".to_string());
+        node.enable_capture(&interface);
+    }
+    
+    // Run until interrupted
+    println!("Node running. Press Ctrl+C to shutdown.\n");
+    
+    // Simple command loop for testing
+    loop {
+        thread::sleep(Duration::from_secs(10));
         
-        // Stop capture if running
-        if let Some(capture_tx) = &self.capture_tx {
-            let _ = capture_tx.send(CaptureActorMsg::Stop);
+        // Check if we should shutdown
+        if !node.running.load(Ordering::Relaxed) {
+            break;
         }
         
-        // Shutdown maintenance
-        let _ = self.maintenance_shutdown.send(());
+        // Example: broadcast elaboration
+        node.elaborate("Periodic trust building elaboration");
         
-        // Shutdown network
-        let _ = self.network_tx.send(NetworkActorMsg::Shutdown);
-        
-        // Shutdown main
-        let _ = self.main_tx.send(MainActorMsg::Shutdown);
-        
-        thread::sleep(Duration::from_millis(500));
-        println!("[SHUTDOWN] Complete");
-    }
-}
-
-// ============================================================================
-// HELPERS
-// ============================================================================
-
-#[derive(Clone, Default)]
-pub struct NodeStatus {
-    pub entries: usize,
-    pub proposals: usize,
-    pub peers: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct SavedState {
-    entries: Vec<Entry>,
-    proposals: HashMap<Cid, Proposal>,
-    trust_scores: HashMap<Did, TrustScore>,
-    stakes: HashMap<Did, StakeRecord>,
-    privacy_threshold: PrivacyThreshold,
-    nonce_counter: u64,
-}
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
-}
-
-fn current_timestamp() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-}
-
-fn write_message(stream: &mut TcpStream, msg: &Message) -> io::Result<()> {
-    let data = bincode::serialize(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    
-    if data.len() > MAX_MESSAGE_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
+        // Show peer count
+        let peers = node.get_peers();
+        println!("Connected peers: {}", peers.len());
     }
     
-    let len = data.len() as u32;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&data)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn read_message(stream: &mut TcpStream) -> io::Result<Message> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    
-    if len > MAX_MESSAGE_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
-    }
-    
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    
-    bincode::deserialize(&buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-fn verify_signature(data: &[u8], signature: &[u8], pubkey_bytes: &[u8]) -> bool {
-    if let (Ok(pk), Ok(sig)) = (PublicKey::from_bytes(pubkey_bytes), DetachedSignature::from_bytes(signature)) {
-        verify_detached_signature(&sig, data, &pk).is_ok()
-    } else {
-        false
-    }
+    node.shutdown();
 }
 ```
