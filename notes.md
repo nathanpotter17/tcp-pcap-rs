@@ -204,6 +204,577 @@ but may not reflect all actions.
 it commits
 - Agents are not Actors (Erlang/Scala)
 
+# Authentication Actor
+
+```rust
+// authenticated_server.rs - Adds DIAGON authentication to existing TCP server
+// This wraps your existing implementation with authentication layer
+
+use std::{
+    thread,
+    sync::{mpsc::{self, Sender, Receiver}, Arc, Mutex},
+    net::{TcpStream, TcpListener},
+    io::{self, Read, Write, ErrorKind, BufWriter},
+    time::{SystemTime, UNIX_EPOCH, Duration, Instant},
+    fs::{File, create_dir_all},
+    path::Path,
+    collections::HashMap,
+};
+
+use sha2::{Sha256, Digest};
+use pqcrypto_dilithium::dilithium3::*;
+use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
+use serde::{Serialize, Deserialize};
+use rand::RngCore;
+
+// Include your existing server code
+include!("your_existing_server.rs");
+
+// ============================================================================
+// CORE IDENTITY TYPES (from DIAGON)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Did(pub String);
+
+impl Did {
+    pub fn from_pubkey(pk: &PublicKey) -> Self {
+        Did(format!("did:diagon:{}", hex::encode(&pk.as_bytes()[..32])))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Cid(pub [u8; 32]);
+
+impl Cid {
+    fn new(data: &[u8], node_did: &Did, nonce: u64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.update(&nonce.to_le_bytes());
+        hasher.update(node_did.0.as_bytes());
+        Cid(hasher.finalize().into())
+    }
+    
+    pub fn short(&self) -> String {
+        hex::encode(&self.0[..8])
+    }
+}
+
+// ============================================================================
+// PROTOCOL MESSAGES (from DIAGON, simplified)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthMessage {
+    Connect(Did, Vec<u8>, [u8; 32]),  // DID, pubkey, pool_commitment
+    Challenge([u8; 32]),                // 32-byte nonce
+    Response(Vec<u8>),                  // signature of challenge
+    Elaborate(String),                  // elaboration text for auth
+    Authenticated,                      // auth successful
+    Rejected(String),                   // auth failed with reason
+}
+
+// ============================================================================
+// TCP FRAMING (from DIAGON)
+// ============================================================================
+
+const MAX_MESSAGE_SIZE: usize = 10_000_000;
+
+fn write_auth_message(stream: &mut TcpStream, msg: &AuthMessage) -> io::Result<()> {
+    let data = bincode::serialize(msg)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    
+    if data.len() > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(ErrorKind::InvalidData, "Message too large"));
+    }
+    
+    let len = data.len() as u32;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(&data)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_auth_message(stream: &mut TcpStream) -> io::Result<AuthMessage> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(ErrorKind::InvalidData, "Message too large"));
+    }
+    
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    
+    bincode::deserialize(&buf)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+}
+
+// ============================================================================
+// AUTHENTICATED CLIENT ACTOR
+// ============================================================================
+
+struct AuthClientActor {
+    receiver: Receiver<AuthClientMessage>,
+    stream: TcpStream,
+    peer_addr: String,
+    auth_state: AuthState,
+    server_identity: Arc<ServerIdentity>,
+}
+
+struct AuthState {
+    peer_did: Option<Did>,
+    peer_pubkey: Option<Vec<u8>>,
+    authenticated: bool,
+    challenge: Option<[u8; 32]>,
+    challenge_time: Option<Instant>,
+}
+
+enum AuthClientMessage {
+    HandleAuth,
+    ProcessData(Vec<u8>),
+    Shutdown,
+}
+
+impl AuthClientActor {
+    fn run(mut self) {
+        // First, handle authentication
+        match self.handle_authentication() {
+            Ok(true) => {
+                println!("[AUTH] {} authenticated successfully", self.peer_addr);
+                // Transition to regular client actor behavior
+                self.run_authenticated();
+            }
+            Ok(false) => {
+                println!("[AUTH] {} authentication incomplete", self.peer_addr);
+            }
+            Err(e) => {
+                println!("[AUTH] {} authentication failed: {}", self.peer_addr, e);
+                let _ = write_auth_message(&mut self.stream, &AuthMessage::Rejected(e.to_string()));
+            }
+        }
+    }
+    
+    fn handle_authentication(&mut self) -> io::Result<bool> {
+        // Set timeout for auth phase
+        self.stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        
+        // Read initial Connect message
+        let connect_msg = read_auth_message(&mut self.stream)?;
+        
+        match connect_msg {
+            AuthMessage::Connect(peer_did, peer_pubkey, peer_pool) => {
+                // Validate DID-pubkey binding
+                if let Err(e) = self.validate_did_pubkey_binding(&peer_did, &peer_pubkey) {
+                    return Err(io::Error::new(ErrorKind::InvalidData, e));
+                }
+                
+                // Validate pool commitment
+                if peer_pool != self.server_identity.pool_commitment {
+                    return Err(io::Error::new(ErrorKind::PermissionDenied, "Pool mismatch"));
+                }
+                
+                // Generate challenge
+                let mut challenge = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut challenge);
+                
+                self.auth_state.peer_did = Some(peer_did);
+                self.auth_state.peer_pubkey = Some(peer_pubkey);
+                self.auth_state.challenge = Some(challenge);
+                self.auth_state.challenge_time = Some(Instant::now());
+                
+                // Send challenge
+                write_auth_message(&mut self.stream, &AuthMessage::Challenge(challenge))?;
+                
+                // Wait for response (signature)
+                let response_msg = read_auth_message(&mut self.stream)?;
+                
+                match response_msg {
+                    AuthMessage::Response(signature) => {
+                        // Verify signature
+                        if !self.verify_challenge_response(&signature)? {
+                            return Err(io::Error::new(ErrorKind::PermissionDenied, "Invalid signature"));
+                        }
+                        
+                        // Request elaboration
+                        let elaborate_msg = read_auth_message(&mut self.stream)?;
+                        
+                        match elaborate_msg {
+                            AuthMessage::Elaborate(text) => {
+                                // Validate elaboration
+                                if text.len() < 20 {
+                                    return Err(io::Error::new(ErrorKind::InvalidData, 
+                                        "Elaboration too short (min 20 chars)"));
+                                }
+                                
+                                // Check challenge timeout (30 seconds for elaboration)
+                                if let Some(challenge_time) = self.auth_state.challenge_time {
+                                    if challenge_time.elapsed() > Duration::from_secs(30) {
+                                        return Err(io::Error::new(ErrorKind::TimedOut, 
+                                            "Challenge expired"));
+                                    }
+                                }
+                                
+                                // Authentication successful
+                                self.auth_state.authenticated = true;
+                                write_auth_message(&mut self.stream, &AuthMessage::Authenticated)?;
+                                
+                                println!("[AUTH] {} elaborated: {}", 
+                                    self.auth_state.peer_did.as_ref().unwrap().0, 
+                                    &text[..50.min(text.len())]);
+                                
+                                Ok(true)
+                            }
+                            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected elaboration"))
+                        }
+                    }
+                    _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected response"))
+                }
+            }
+            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected connect"))
+        }
+    }
+    
+    fn run_authenticated(mut self) {
+        // Switch to non-blocking for main operation
+        self.stream.set_nonblocking(true).expect("Failed to set non-blocking");
+        self.stream.set_read_timeout(None).ok();
+        
+        let mut buffer = [0; 1024];
+        
+        println!("[AUTHENTICATED] {} entering main loop", 
+            self.auth_state.peer_did.as_ref().unwrap().0);
+        
+        loop {
+            // Check for control messages
+            if let Ok(msg) = self.receiver.try_recv() {
+                match msg {
+                    AuthClientMessage::ProcessData(data) => {
+                        println!("[DATA] Sending {} bytes to {}", 
+                            data.len(), self.peer_addr);
+                        if let Err(e) = self.stream.write_all(&data) {
+                            eprintln!("[ERROR] Write failed: {:?}", e);
+                            break;
+                        }
+                    }
+                    AuthClientMessage::Shutdown => {
+                        println!("[SHUTDOWN] {}", self.peer_addr);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            
+            // Try to read application data
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    println!("[CLOSED] {}", self.peer_addr);
+                    break;
+                }
+                Ok(n) => {
+                    let data = buffer[0..n].to_vec();
+                    println!("[RECV] {} bytes from {}", n, self.peer_addr);
+                    
+                    // Echo back
+                    if let Err(e) = self.stream.write_all(&data) {
+                        eprintln!("[ERROR] Echo write failed: {:?}", e);
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Read failed: {:?}", e);
+                    break;
+                }
+            }
+        }
+        
+        println!("[DISCONNECTED] {}", self.peer_addr);
+    }
+    
+    fn validate_did_pubkey_binding(&self, did: &Did, pubkey_bytes: &[u8]) -> Result<(), String> {
+        let pubkey = PublicKey::from_bytes(pubkey_bytes)
+            .map_err(|_| "Invalid public key bytes")?;
+        
+        if Did::from_pubkey(&pubkey) != *did {
+            return Err("DID does not match public key".into());
+        }
+        
+        Ok(())
+    }
+    
+    fn verify_challenge_response(&self, signature: &[u8]) -> io::Result<bool> {
+        let challenge = self.auth_state.challenge
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "No active challenge"))?;
+        
+        let pubkey_bytes = self.auth_state.peer_pubkey.as_ref()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "No peer pubkey"))?;
+        
+        let pubkey = PublicKey::from_bytes(pubkey_bytes)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        
+        let sig = DetachedSignature::from_bytes(signature)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        
+        Ok(verify_detached_signature(&sig, &challenge, &pubkey).is_ok())
+    }
+}
+
+// ============================================================================
+// AUTHENTICATED CLIENT HANDLE
+// ============================================================================
+
+#[derive(Clone)]
+struct AuthClientHandle {
+    sender: Sender<AuthClientMessage>,
+}
+
+impl AuthClientHandle {
+    fn new(stream: TcpStream, server_identity: Arc<ServerIdentity>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        
+        let peer_addr = stream.peer_addr()
+            .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
+        
+        println!("[NEW CONNECTION] {}", peer_addr);
+        
+        let actor = AuthClientActor {
+            receiver,
+            stream,
+            peer_addr,
+            auth_state: AuthState {
+                peer_did: None,
+                peer_pubkey: None,
+                authenticated: false,
+                challenge: None,
+                challenge_time: None,
+            },
+            server_identity,
+        };
+        
+        thread::spawn(move || actor.run());
+        
+        Self { sender }
+    }
+    
+    fn send_data(&self, data: Vec<u8>) -> Result<(), mpsc::SendError<AuthClientMessage>> {
+        self.sender.send(AuthClientMessage::ProcessData(data))
+    }
+    
+    fn shutdown(&self) -> Result<(), mpsc::SendError<AuthClientMessage>> {
+        self.sender.send(AuthClientMessage::Shutdown)
+    }
+}
+
+// ============================================================================
+// SERVER IDENTITY MANAGEMENT
+// ============================================================================
+
+struct ServerIdentity {
+    did: Did,
+    public_key: PublicKey,
+    secret_key: SecretKey,
+    pool_commitment: [u8; 32],
+    nonce_counter: Mutex<u64>,
+}
+
+impl ServerIdentity {
+    fn load_or_create(addr: &str) -> io::Result<Arc<Self>> {
+        create_dir_all("db").ok();
+        
+        let addr_hash = hex::encode(&sha256(addr.as_bytes())[..8]);
+        let identity_path = format!("db/identity_{}.cbor", addr_hash);
+        
+        let (pk, sk, did) = if Path::new(&identity_path).exists() {
+            // Load existing identity
+            let data = std::fs::read(&identity_path)?;
+            if let Ok((pk_bytes, sk_bytes, did)) = 
+                serde_cbor::from_slice::<(Vec<u8>, Vec<u8>, Did)>(&data) {
+                if let (Ok(pk), Ok(sk)) = (
+                    PublicKey::from_bytes(&pk_bytes),
+                    SecretKey::from_bytes(&sk_bytes)
+                ) {
+                    if Did::from_pubkey(&pk) == did {
+                        (pk, sk, did)
+                    } else {
+                        let (pk, sk) = keypair();
+                        let did = Did::from_pubkey(&pk);
+                        (pk, sk, did)
+                    }
+                } else {
+                    let (pk, sk) = keypair();
+                    let did = Did::from_pubkey(&pk);
+                    (pk, sk, did)
+                }
+            } else {
+                let (pk, sk) = keypair();
+                let did = Did::from_pubkey(&pk);
+                (pk, sk, did)
+            }
+        } else {
+            // Create new identity
+            let (pk, sk) = keypair();
+            let did = Did::from_pubkey(&pk);
+            
+            // Save identity
+            let identity = (pk.as_bytes().to_vec(), sk.as_bytes().to_vec(), did.clone());
+            if let Ok(file) = File::create(&identity_path) {
+                let _ = serde_cbor::to_writer(BufWriter::new(file), &identity);
+            }
+            
+            (pk, sk, did)
+        };
+        
+        println!("[IDENTITY] Server DID: {}", did.0);
+        
+        Ok(Arc::new(Self {
+            did,
+            public_key: pk,
+            secret_key: sk,
+            pool_commitment: [0; 32],  // Will be set with set_pool()
+            nonce_counter: Mutex::new(0),
+        }))
+    }
+    
+    fn set_pool(&mut self, passphrase: &str) {
+        self.pool_commitment = sha256(passphrase.as_bytes());
+        println!("[POOL] Set to: {}", hex::encode(&self.pool_commitment[..8]));
+    }
+    
+    fn generate_cid(&self, data: &[u8]) -> Cid {
+        let mut counter = self.nonce_counter.lock().unwrap();
+        *counter += 1;
+        Cid::new(data, &self.did, *counter)
+    }
+    
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        detached_sign(data, &self.secret_key).as_bytes().to_vec()
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// ============================================================================
+// AUTHENTICATED SERVER MAIN
+// ============================================================================
+
+fn main() {
+    let addr = std::env::args().nth(1)
+        .unwrap_or_else(|| "0.0.0.0:9090".to_string());
+    
+    let pool = std::env::args().nth(2)
+        .unwrap_or_else(|| "default_pool".to_string());
+    
+    // Initialize server identity
+    let mut server_identity = ServerIdentity::load_or_create(&addr)
+        .expect("Failed to load identity");
+    
+    // Set pool commitment from passphrase
+    Arc::get_mut(&mut server_identity)
+        .expect("Failed to get mutable reference")
+        .set_pool(&pool);
+    
+    // Start packet capture if desired
+    if std::env::var("CAPTURE").is_ok() {
+        let capture_handle = CaptureHandle::new();
+        capture_handle.start().expect("Failed to start capture");
+    }
+    
+    // Start TCP listener
+    let listener = TcpListener::bind(&addr).expect("Failed to bind");
+    println!("[SERVER] Listening on {} (pool: {})", addr, &pool);
+    
+    // Store authenticated client handles
+    let clients = Arc::new(Mutex::new(Vec::<AuthClientHandle>::new()));
+    
+    // Accept loop
+    for stream_result in listener.incoming() {
+        if let Ok(stream) = stream_result {
+            let handle = AuthClientHandle::new(stream, Arc::clone(&server_identity));
+            clients.lock().unwrap().push(handle);
+        }
+    }
+}
+
+// ============================================================================
+// CLIENT EXAMPLE
+// ============================================================================
+
+#[cfg(test)]
+mod client_example {
+    use super::*;
+    
+    pub fn connect_to_server(server_addr: &str, pool_passphrase: &str) -> io::Result<()> {
+        // Load or create client identity
+        let client_identity = ServerIdentity::load_or_create("client")?;
+        Arc::get_mut(&mut client_identity.clone()).unwrap().set_pool(pool_passphrase);
+        
+        // Connect to server
+        let mut stream = TcpStream::connect(server_addr)?;
+        
+        // Send Connect message
+        let connect_msg = AuthMessage::Connect(
+            client_identity.did.clone(),
+            client_identity.public_key.as_bytes().to_vec(),
+            client_identity.pool_commitment
+        );
+        write_auth_message(&mut stream, &connect_msg)?;
+        
+        // Receive challenge
+        let challenge_msg = read_auth_message(&mut stream)?;
+        
+        match challenge_msg {
+            AuthMessage::Challenge(nonce) => {
+                // Sign challenge
+                let signature = client_identity.sign(&nonce);
+                write_auth_message(&mut stream, &AuthMessage::Response(signature))?;
+                
+                // Send elaboration
+                let elaboration = "I am connecting to participate in the distributed knowledge network";
+                write_auth_message(&mut stream, &AuthMessage::Elaborate(elaboration.to_string()))?;
+                
+                // Wait for authentication result
+                let auth_result = read_auth_message(&mut stream)?;
+                
+                match auth_result {
+                    AuthMessage::Authenticated => {
+                        println!("[CLIENT] Authenticated successfully!");
+                        // Now can use regular TCP for application protocol
+                        Ok(())
+                    }
+                    AuthMessage::Rejected(reason) => {
+                        Err(io::Error::new(ErrorKind::PermissionDenied, reason))
+                    }
+                    _ => Err(io::Error::new(ErrorKind::InvalidData, "Unexpected response"))
+                }
+            }
+            AuthMessage::Rejected(reason) => {
+                Err(io::Error::new(ErrorKind::PermissionDenied, reason))
+            }
+            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected challenge"))
+        }
+    }
+}
+```
+
 # Actor Governance
 
 ```rust
