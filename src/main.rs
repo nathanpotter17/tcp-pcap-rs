@@ -161,11 +161,14 @@ impl PacketCaptureActor {
         let use_loopback = std::env::var("TEST_MODE").is_ok();
         
         let device = if use_loopback {
-            devices.iter().find(|d| 
+            devices.iter().find(|d| {
+                // Linux: device name is "lo"
+                // Windows: description contains "loopback"
+                d.name == "lo" || 
                 d.desc.as_ref()
                     .map(|s| s.to_lowercase().contains("loopback"))
                     .unwrap_or(false)
-            ).expect("Loopback not found")
+            }).expect("Loopback interface not found")
         } else {
             devices.iter().find(|d| {
                 let desc = d.desc.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();

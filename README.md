@@ -18,7 +18,8 @@ See https://npcap.com/ for more.
 
 ```toml
 [env]
-CAPTURE = "1"
+TEST_MODE = "1" // Use Win / Linux loopback
+CAPTURE = "1" // Capture packets
 LIBPCAP_LIBDIR = "C:/Users/.../npcap-sdk-1.15/Lib/x64"
 LIBPCAP_VER = "1.15.0"
 ```
