@@ -18,7 +18,8 @@ See https://npcap.com/ for more.
 
 ```toml
 [env]
-LIBPCAP_LIBDIR = "C:/Users/nathan/npcap-sdk-1.15/Lib/x64"
+CAPTURE = "1"
+LIBPCAP_LIBDIR = "C:/Users/.../npcap-sdk-1.15/Lib/x64"
 LIBPCAP_VER = "1.15.0"
 ```
 
@@ -34,18 +35,42 @@ via your own build script.
 
 ## Testing
 
-## Find your IP
+### Find your IP
 ```bash
 ipconfig
+
+or
+
+ip addr
 ```
 
-### Bind to your actual network IP
+### Local
+
 ```bash
-cargo run 192.168.xx.xx:9090
+# Default Server Mode
+./tcp-server
+./tcp-server server
+./tcp-server server 0.0.0.0:9090 my_pool
+
+# Client Mode
+./tcp-server client 127.0.0.1:9090
+./tcp-server client 127.0.0.1:9090 my_pool
 ```
 
-### Then connect from another machine or use the IP
+### Remote
 ```bash
-echo "Hello Rust" | ncat 192.168.xx.xx 9090
+# Server listens on all network interfaces
+./tcp-server server 0.0.0.0:9090
+
+# Then connect from any machine using your actual IP
+./tcp-server client 192.168.xx.xx:9090
 ```
 
+**With custom pool:**
+```bash
+# Server
+./tcp-server server 0.0.0.0:9090 production_pool
+
+# Client (pool must match!)
+./tcp-server client 192.168.1.100:9090 production_pool
+```
