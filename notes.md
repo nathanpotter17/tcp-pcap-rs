@@ -204,1760 +204,678 @@ but may not reflect all actions.
 it commits
 - Agents are not Actors (Erlang/Scala)
 
-# Authentication Actor
+# The Datomic Model 
 
 ```rust
-// authenticated_server.rs - Adds DIAGON authentication to existing TCP server
-// This wraps your existing implementation with authentication layer
-
-use std::{
-    thread,
-    sync::{mpsc::{self, Sender, Receiver}, Arc, Mutex},
-    net::{TcpStream, TcpListener},
-    io::{self, Read, Write, ErrorKind, BufWriter},
-    time::{SystemTime, UNIX_EPOCH, Duration, Instant},
-    fs::{File, create_dir_all},
-    path::Path,
-    collections::HashMap,
-};
-
-use sha2::{Sha256, Digest};
-use pqcrypto_dilithium::dilithium3::*;
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
-use serde::{Serialize, Deserialize};
-use rand::RngCore;
-
-// Include your existing server code
-include!("your_existing_server.rs");
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 // ============================================================================
-// CORE IDENTITY TYPES (from DIAGON)
+// DATOM MODEL - The Core of Datomic
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Did(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct EntityId(pub u64);
 
-impl Did {
-    pub fn from_pubkey(pk: &PublicKey) -> Self {
-        Did(format!("did:diagon:{}", hex::encode(&pk.as_bytes()[..32])))
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct AttributeId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct TxId(pub u64);
+
+impl TxId {
+    pub fn to_entity_id(&self) -> EntityId {
+        EntityId(self.0)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Cid(pub [u8; 32]);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Value {
+    Boolean(bool),
+    Long(i64),
+    String(String),
+    Ref(EntityId),
+    Instant(u64),
+    Bytes(Vec<u8>),
+    Double([u8; 8]), // Store as bytes for Ord trait
+}
 
-impl Cid {
-    fn new(data: &[u8], node_did: &Did, nonce: u64) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hasher.update(&nonce.to_le_bytes());
-        hasher.update(node_did.0.as_bytes());
-        Cid(hasher.finalize().into())
+impl Value {
+    pub fn double(f: f64) -> Self {
+        Value::Double(f.to_bits().to_be_bytes())
     }
     
-    pub fn short(&self) -> String {
-        hex::encode(&self.0[..8])
+    pub fn get_double(&self) -> Option<f64> {
+        match self {
+            Value::Double(bytes) => Some(f64::from_bits(u64::from_be_bytes(*bytes))),
+            _ => None,
+        }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Op {
+    Assert,
+    Retract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Datom {
+    pub entity: EntityId,
+    pub attribute: AttributeId,
+    pub value: Value,
+    pub tx: TxId,
+    pub op: Op,
+}
+
 // ============================================================================
-// PROTOCOL MESSAGES (from DIAGON, simplified)
+// SCHEMA - Define attributes and their properties
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AuthMessage {
-    Connect(Did, Vec<u8>, [u8; 32]),  // DID, pubkey, pool_commitment
-    Challenge([u8; 32]),                // 32-byte nonce
-    Response(Vec<u8>),                  // signature of challenge
-    Elaborate(String),                  // elaboration text for auth
-    Authenticated,                      // auth successful
-    Rejected(String),                   // auth failed with reason
+pub struct Attribute {
+    pub id: AttributeId,
+    pub ident: String,
+    pub value_type: ValueType,
+    pub cardinality: Cardinality,
+    pub indexed: bool,
+    pub unique: Option<Uniqueness>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValueType {
+    Boolean,
+    Long,
+    String,
+    Ref,
+    Instant,
+    Bytes,
+    Double,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cardinality {
+    One,
+    Many,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Uniqueness {
+    Value,
+    Identity,
 }
 
 // ============================================================================
-// TCP FRAMING (from DIAGON)
+// TEMPORAL DATABASE - The heart of Datomic
 // ============================================================================
 
-const MAX_MESSAGE_SIZE: usize = 10_000_000;
-
-fn write_auth_message(stream: &mut TcpStream, msg: &AuthMessage) -> io::Result<()> {
-    let data = bincode::serialize(msg)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+pub struct TemporalDatabase {
+    // The four indexes that make Datomic queries fast
+    eavt: BTreeMap<(EntityId, AttributeId, Value, TxId), Datom>,
+    aevt: BTreeMap<(AttributeId, EntityId, Value, TxId), Datom>,
+    avet: BTreeMap<(AttributeId, Value, EntityId, TxId), Datom>,
+    vaet: BTreeMap<(EntityId, AttributeId, EntityId, TxId), ()>, // For ref lookups
     
-    if data.len() > MAX_MESSAGE_SIZE {
-        return Err(io::Error::new(ErrorKind::InvalidData, "Message too large"));
+    // Transaction log - the source of truth
+    tx_log: BTreeMap<TxId, Transaction>,
+    
+    // Schema
+    schema: HashMap<AttributeId, Attribute>,
+    schema_by_ident: HashMap<String, AttributeId>,
+    
+    // Entity ID allocation
+    next_entity_id: u64,
+    next_tx_id: u64,
+}
+
+impl TemporalDatabase {
+    pub fn new() -> Self {
+        let mut db = Self {
+            eavt: BTreeMap::new(),
+            aevt: BTreeMap::new(),
+            avet: BTreeMap::new(),
+            vaet: BTreeMap::new(),
+            tx_log: BTreeMap::new(),
+            schema: HashMap::new(),
+            schema_by_ident: HashMap::new(),
+            next_entity_id: 1000, // Reserve lower IDs for system entities
+            next_tx_id: 1000,
+        };
+        
+        // Bootstrap core schema attributes
+        db.bootstrap_schema();
+        db
     }
     
-    let len = data.len() as u32;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&data)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn read_auth_message(stream: &mut TcpStream) -> io::Result<AuthMessage> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    
-    if len > MAX_MESSAGE_SIZE {
-        return Err(io::Error::new(ErrorKind::InvalidData, "Message too large"));
+    fn bootstrap_schema(&mut self) {
+        // Core attributes for the schema itself
+        self.register_attribute(Attribute {
+            id: AttributeId(1),
+            ident: "db/ident".to_string(),
+            value_type: ValueType::String,
+            cardinality: Cardinality::One,
+            indexed: true,
+            unique: Some(Uniqueness::Identity),
+        });
+        
+        self.register_attribute(Attribute {
+            id: AttributeId(2),
+            ident: "db/valueType".to_string(),
+            value_type: ValueType::Ref,
+            cardinality: Cardinality::One,
+            indexed: false,
+            unique: None,
+        });
+        
+        // User-facing attributes
+        self.register_attribute(Attribute {
+            id: AttributeId(100),
+            ident: "user/did".to_string(),
+            value_type: ValueType::String,
+            cardinality: Cardinality::One,
+            indexed: true,
+            unique: Some(Uniqueness::Identity),
+        });
+        
+        self.register_attribute(Attribute {
+            id: AttributeId(101),
+            ident: "user/pubkey".to_string(),
+            value_type: ValueType::Bytes,
+            cardinality: Cardinality::One,
+            indexed: false,
+            unique: None,
+        });
+        
+        self.register_attribute(Attribute {
+            id: AttributeId(102),
+            ident: "user/trust".to_string(),
+            value_type: ValueType::Double,
+            cardinality: Cardinality::One,
+            indexed: true,
+            unique: None,
+        });
     }
     
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
+    fn register_attribute(&mut self, attr: Attribute) {
+        self.schema_by_ident.insert(attr.ident.clone(), attr.id);
+        self.schema.insert(attr.id, attr);
+    }
     
-    bincode::deserialize(&buf)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
-}
-
-// ============================================================================
-// AUTHENTICATED CLIENT ACTOR
-// ============================================================================
-
-struct AuthClientActor {
-    receiver: Receiver<AuthClientMessage>,
-    stream: TcpStream,
-    peer_addr: String,
-    auth_state: AuthState,
-    server_identity: Arc<ServerIdentity>,
-}
-
-struct AuthState {
-    peer_did: Option<Did>,
-    peer_pubkey: Option<Vec<u8>>,
-    authenticated: bool,
-    challenge: Option<[u8; 32]>,
-    challenge_time: Option<Instant>,
-}
-
-enum AuthClientMessage {
-    HandleAuth,
-    ProcessData(Vec<u8>),
-    Shutdown,
-}
-
-impl AuthClientActor {
-    fn run(mut self) {
-        // First, handle authentication
-        match self.handle_authentication() {
-            Ok(true) => {
-                println!("[AUTH] {} authenticated successfully", self.peer_addr);
-                // Transition to regular client actor behavior
-                self.run_authenticated();
-            }
-            Ok(false) => {
-                println!("[AUTH] {} authentication incomplete", self.peer_addr);
-            }
-            Err(e) => {
-                println!("[AUTH] {} authentication failed: {}", self.peer_addr, e);
-                let _ = write_auth_message(&mut self.stream, &AuthMessage::Rejected(e.to_string()));
-            }
+    pub fn allocate_entity_id(&mut self) -> EntityId {
+        let id = EntityId(self.next_entity_id);
+        self.next_entity_id += 1;
+        id
+    }
+    
+    pub fn allocate_tx_id(&mut self) -> TxId {
+        let id = TxId(self.next_tx_id);
+        self.next_tx_id += 1;
+        id
+    }
+    
+    // Apply a transaction's datoms to all indexes
+    pub fn apply_transaction(&mut self, tx: Transaction) -> Result<(), String> {
+        // Validate all datoms against schema
+        for datom in &tx.datoms {
+            self.validate_datom(datom)?;
         }
-    }
-    
-    fn handle_authentication(&mut self) -> io::Result<bool> {
-        // Set timeout for auth phase
-        self.stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         
-        // Read initial Connect message
-        let connect_msg = read_auth_message(&mut self.stream)?;
-        
-        match connect_msg {
-            AuthMessage::Connect(peer_did, peer_pubkey, peer_pool) => {
-                // Validate DID-pubkey binding
-                if let Err(e) = self.validate_did_pubkey_binding(&peer_did, &peer_pubkey) {
-                    return Err(io::Error::new(ErrorKind::InvalidData, e));
-                }
-                
-                // Validate pool commitment
-                if peer_pool != self.server_identity.pool_commitment {
-                    return Err(io::Error::new(ErrorKind::PermissionDenied, "Pool mismatch"));
-                }
-                
-                // Generate challenge
-                let mut challenge = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut challenge);
-                
-                self.auth_state.peer_did = Some(peer_did);
-                self.auth_state.peer_pubkey = Some(peer_pubkey);
-                self.auth_state.challenge = Some(challenge);
-                self.auth_state.challenge_time = Some(Instant::now());
-                
-                // Send challenge
-                write_auth_message(&mut self.stream, &AuthMessage::Challenge(challenge))?;
-                
-                // Wait for response (signature)
-                let response_msg = read_auth_message(&mut self.stream)?;
-                
-                match response_msg {
-                    AuthMessage::Response(signature) => {
-                        // Verify signature
-                        if !self.verify_challenge_response(&signature)? {
-                            return Err(io::Error::new(ErrorKind::PermissionDenied, "Invalid signature"));
-                        }
-                        
-                        // Request elaboration
-                        let elaborate_msg = read_auth_message(&mut self.stream)?;
-                        
-                        match elaborate_msg {
-                            AuthMessage::Elaborate(text) => {
-                                // Validate elaboration
-                                if text.len() < 20 {
-                                    return Err(io::Error::new(ErrorKind::InvalidData, 
-                                        "Elaboration too short (min 20 chars)"));
-                                }
-                                
-                                // Check challenge timeout (30 seconds for elaboration)
-                                if let Some(challenge_time) = self.auth_state.challenge_time {
-                                    if challenge_time.elapsed() > Duration::from_secs(30) {
-                                        return Err(io::Error::new(ErrorKind::TimedOut, 
-                                            "Challenge expired"));
-                                    }
-                                }
-                                
-                                // Authentication successful
-                                self.auth_state.authenticated = true;
-                                write_auth_message(&mut self.stream, &AuthMessage::Authenticated)?;
-                                
-                                println!("[AUTH] {} elaborated: {}", 
-                                    self.auth_state.peer_did.as_ref().unwrap().0, 
-                                    &text[..50.min(text.len())]);
-                                
-                                Ok(true)
-                            }
-                            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected elaboration"))
-                        }
-                    }
-                    _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected response"))
-                }
-            }
-            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected connect"))
-        }
-    }
-    
-    fn run_authenticated(mut self) {
-        // Switch to non-blocking for main operation
-        self.stream.set_nonblocking(true).expect("Failed to set non-blocking");
-        self.stream.set_read_timeout(None).ok();
-        
-        let mut buffer = [0; 1024];
-        
-        println!("[AUTHENTICATED] {} entering main loop", 
-            self.auth_state.peer_did.as_ref().unwrap().0);
-        
-        loop {
-            // Check for control messages
-            if let Ok(msg) = self.receiver.try_recv() {
-                match msg {
-                    AuthClientMessage::ProcessData(data) => {
-                        println!("[DATA] Sending {} bytes to {}", 
-                            data.len(), self.peer_addr);
-                        if let Err(e) = self.stream.write_all(&data) {
-                            eprintln!("[ERROR] Write failed: {:?}", e);
-                            break;
-                        }
-                    }
-                    AuthClientMessage::Shutdown => {
-                        println!("[SHUTDOWN] {}", self.peer_addr);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            
-            // Try to read application data
-            match self.stream.read(&mut buffer) {
-                Ok(0) => {
-                    println!("[CLOSED] {}", self.peer_addr);
-                    break;
-                }
-                Ok(n) => {
-                    let data = buffer[0..n].to_vec();
-                    println!("[RECV] {} bytes from {}", n, self.peer_addr);
-                    
-                    // Echo back
-                    if let Err(e) = self.stream.write_all(&data) {
-                        eprintln!("[ERROR] Echo write failed: {:?}", e);
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    eprintln!("[ERROR] Read failed: {:?}", e);
-                    break;
-                }
+        // Apply each datom
+        for datom in &tx.datoms {
+            match datom.op {
+                Op::Assert => self.assert_datom(datom.clone()),
+                Op::Retract => self.retract_datom(datom.clone()),
             }
         }
         
-        println!("[DISCONNECTED] {}", self.peer_addr);
+        // Store transaction in log
+        self.tx_log.insert(tx.id, tx);
+        
+        Ok(())
     }
     
-    fn validate_did_pubkey_binding(&self, did: &Did, pubkey_bytes: &[u8]) -> Result<(), String> {
-        let pubkey = PublicKey::from_bytes(pubkey_bytes)
-            .map_err(|_| "Invalid public key bytes")?;
+    fn validate_datom(&self, datom: &Datom) -> Result<(), String> {
+        let attr = self.schema.get(&datom.attribute)
+            .ok_or_else(|| format!("Unknown attribute: {:?}", datom.attribute))?;
         
-        if Did::from_pubkey(&pubkey) != *did {
-            return Err("DID does not match public key".into());
+        // Validate value type
+        let valid_type = match (&datom.value, attr.value_type) {
+            (Value::Boolean(_), ValueType::Boolean) => true,
+            (Value::Long(_), ValueType::Long) => true,
+            (Value::String(_), ValueType::String) => true,
+            (Value::Ref(_), ValueType::Ref) => true,
+            (Value::Instant(_), ValueType::Instant) => true,
+            (Value::Bytes(_), ValueType::Bytes) => true,
+            (Value::Double(_), ValueType::Double) => true,
+            _ => false,
+        };
+        
+        if !valid_type {
+            return Err(format!("Type mismatch for attribute {}: expected {:?}", 
+                attr.ident, attr.value_type));
         }
         
         Ok(())
     }
     
-    fn verify_challenge_response(&self, signature: &[u8]) -> io::Result<bool> {
-        let challenge = self.auth_state.challenge
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "No active challenge"))?;
+    fn assert_datom(&mut self, datom: Datom) {
+        // Add to EAVT index
+        self.eavt.insert(
+            (datom.entity, datom.attribute, datom.value.clone(), datom.tx),
+            datom.clone()
+        );
         
-        let pubkey_bytes = self.auth_state.peer_pubkey.as_ref()
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "No peer pubkey"))?;
+        // Add to AEVT index
+        self.aevt.insert(
+            (datom.attribute, datom.entity, datom.value.clone(), datom.tx),
+            datom.clone()
+        );
         
-        let pubkey = PublicKey::from_bytes(pubkey_bytes)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        
-        let sig = DetachedSignature::from_bytes(signature)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        
-        Ok(verify_detached_signature(&sig, &challenge, &pubkey).is_ok())
-    }
-}
-
-// ============================================================================
-// AUTHENTICATED CLIENT HANDLE
-// ============================================================================
-
-#[derive(Clone)]
-struct AuthClientHandle {
-    sender: Sender<AuthClientMessage>,
-}
-
-impl AuthClientHandle {
-    fn new(stream: TcpStream, server_identity: Arc<ServerIdentity>) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        
-        let peer_addr = stream.peer_addr()
-            .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
-        
-        println!("[NEW CONNECTION] {}", peer_addr);
-        
-        let actor = AuthClientActor {
-            receiver,
-            stream,
-            peer_addr,
-            auth_state: AuthState {
-                peer_did: None,
-                peer_pubkey: None,
-                authenticated: false,
-                challenge: None,
-                challenge_time: None,
-            },
-            server_identity,
-        };
-        
-        thread::spawn(move || actor.run());
-        
-        Self { sender }
-    }
-    
-    fn send_data(&self, data: Vec<u8>) -> Result<(), mpsc::SendError<AuthClientMessage>> {
-        self.sender.send(AuthClientMessage::ProcessData(data))
-    }
-    
-    fn shutdown(&self) -> Result<(), mpsc::SendError<AuthClientMessage>> {
-        self.sender.send(AuthClientMessage::Shutdown)
-    }
-}
-
-// ============================================================================
-// SERVER IDENTITY MANAGEMENT
-// ============================================================================
-
-struct ServerIdentity {
-    did: Did,
-    public_key: PublicKey,
-    secret_key: SecretKey,
-    pool_commitment: [u8; 32],
-    nonce_counter: Mutex<u64>,
-}
-
-impl ServerIdentity {
-    fn load_or_create(addr: &str) -> io::Result<Arc<Self>> {
-        create_dir_all("db").ok();
-        
-        let addr_hash = hex::encode(&sha256(addr.as_bytes())[..8]);
-        let identity_path = format!("db/identity_{}.cbor", addr_hash);
-        
-        let (pk, sk, did) = if Path::new(&identity_path).exists() {
-            // Load existing identity
-            let data = std::fs::read(&identity_path)?;
-            if let Ok((pk_bytes, sk_bytes, did)) = 
-                serde_cbor::from_slice::<(Vec<u8>, Vec<u8>, Did)>(&data) {
-                if let (Ok(pk), Ok(sk)) = (
-                    PublicKey::from_bytes(&pk_bytes),
-                    SecretKey::from_bytes(&sk_bytes)
-                ) {
-                    if Did::from_pubkey(&pk) == did {
-                        (pk, sk, did)
-                    } else {
-                        let (pk, sk) = keypair();
-                        let did = Did::from_pubkey(&pk);
-                        (pk, sk, did)
-                    }
-                } else {
-                    let (pk, sk) = keypair();
-                    let did = Did::from_pubkey(&pk);
-                    (pk, sk, did)
-                }
-            } else {
-                let (pk, sk) = keypair();
-                let did = Did::from_pubkey(&pk);
-                (pk, sk, did)
+        // Add to AVET index if indexed
+        if let Some(attr) = self.schema.get(&datom.attribute) {
+            if attr.indexed {
+                self.avet.insert(
+                    (datom.attribute, datom.value.clone(), datom.entity, datom.tx),
+                    datom.clone()
+                );
             }
-        } else {
-            // Create new identity
-            let (pk, sk) = keypair();
-            let did = Did::from_pubkey(&pk);
-            
-            // Save identity
-            let identity = (pk.as_bytes().to_vec(), sk.as_bytes().to_vec(), did.clone());
-            if let Ok(file) = File::create(&identity_path) {
-                let _ = serde_cbor::to_writer(BufWriter::new(file), &identity);
+        }
+        
+        // Add to VAET index if it's a ref
+        if let Value::Ref(ref_entity) = datom.value {
+            self.vaet.insert(
+                (ref_entity, datom.attribute, datom.entity, datom.tx),
+                ()
+            );
+        }
+    }
+    
+    fn retract_datom(&mut self, datom: Datom) {
+        // We keep the retraction in the log but remove from current indexes
+        // This is how Datomic maintains history - retractions are facts too
+        
+        // Find and remove from EAVT
+        let eavt_key = (datom.entity, datom.attribute, datom.value.clone(), datom.tx);
+        self.eavt.remove(&eavt_key);
+        
+        // Remove from other indexes similarly
+        let aevt_key = (datom.attribute, datom.entity, datom.value.clone(), datom.tx);
+        self.aevt.remove(&aevt_key);
+        
+        if let Some(attr) = self.schema.get(&datom.attribute) {
+            if attr.indexed {
+                let avet_key = (datom.attribute, datom.value.clone(), datom.entity, datom.tx);
+                self.avet.remove(&avet_key);
             }
-            
-            (pk, sk, did)
-        };
+        }
         
-        println!("[IDENTITY] Server DID: {}", did.0);
-        
-        Ok(Arc::new(Self {
-            did,
-            public_key: pk,
-            secret_key: sk,
-            pool_commitment: [0; 32],  // Will be set with set_pool()
-            nonce_counter: Mutex::new(0),
-        }))
-    }
-    
-    fn set_pool(&mut self, passphrase: &str) {
-        self.pool_commitment = sha256(passphrase.as_bytes());
-        println!("[POOL] Set to: {}", hex::encode(&self.pool_commitment[..8]));
-    }
-    
-    fn generate_cid(&self, data: &[u8]) -> Cid {
-        let mut counter = self.nonce_counter.lock().unwrap();
-        *counter += 1;
-        Cid::new(data, &self.did, *counter)
-    }
-    
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        detached_sign(data, &self.secret_key).as_bytes().to_vec()
-    }
-}
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
-}
-
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-// ============================================================================
-// AUTHENTICATED SERVER MAIN
-// ============================================================================
-
-fn main() {
-    let addr = std::env::args().nth(1)
-        .unwrap_or_else(|| "0.0.0.0:9090".to_string());
-    
-    let pool = std::env::args().nth(2)
-        .unwrap_or_else(|| "default_pool".to_string());
-    
-    // Initialize server identity
-    let mut server_identity = ServerIdentity::load_or_create(&addr)
-        .expect("Failed to load identity");
-    
-    // Set pool commitment from passphrase
-    Arc::get_mut(&mut server_identity)
-        .expect("Failed to get mutable reference")
-        .set_pool(&pool);
-    
-    // Start packet capture if desired
-    if std::env::var("CAPTURE").is_ok() {
-        let capture_handle = CaptureHandle::new();
-        capture_handle.start().expect("Failed to start capture");
-    }
-    
-    // Start TCP listener
-    let listener = TcpListener::bind(&addr).expect("Failed to bind");
-    println!("[SERVER] Listening on {} (pool: {})", addr, &pool);
-    
-    // Store authenticated client handles
-    let clients = Arc::new(Mutex::new(Vec::<AuthClientHandle>::new()));
-    
-    // Accept loop
-    for stream_result in listener.incoming() {
-        if let Ok(stream) = stream_result {
-            let handle = AuthClientHandle::new(stream, Arc::clone(&server_identity));
-            clients.lock().unwrap().push(handle);
+        if let Value::Ref(ref_entity) = datom.value {
+            let vaet_key = (ref_entity, datom.attribute, datom.entity, datom.tx);
+            self.vaet.remove(&vaet_key);
         }
     }
 }
 
 // ============================================================================
-// CLIENT EXAMPLE
+// QUERY ENGINE - Datalog-style queries
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub entity: Option<EntityId>,
+    pub attribute: Option<AttributeId>,
+    pub value: Option<Value>,
+    pub tx: Option<TxId>,
+}
+
+impl TemporalDatabase {
+    pub fn query(&self, patterns: Vec<Pattern>) -> Vec<Datom> {
+        let mut results = Vec::new();
+        
+        for pattern in patterns {
+            let matches = self.query_pattern(&pattern);
+            results.extend(matches);
+        }
+        
+        results
+    }
+    
+    fn query_pattern(&self, pattern: &Pattern) -> Vec<Datom> {
+        match (&pattern.entity, &pattern.attribute, &pattern.value) {
+            // Most specific: E-A-V
+            (Some(e), Some(a), Some(v)) => {
+                let start = (*e, *a, v.clone(), TxId(0));
+                let end = (*e, *a, v.clone(), TxId(u64::MAX));
+                
+                self.eavt
+                    .range(start..=end)
+                    .filter(|(key, _)| {
+                        pattern.tx.map_or(true, |tx| key.3 == tx)
+                    })
+                    .map(|(_, datom)| datom.clone())
+                    .collect()
+            }
+            
+            // E-A
+            (Some(e), Some(a), None) => {
+                let start = (*e, *a, Value::Boolean(false), TxId(0));
+                let end = (*e, *a, Value::Bytes(vec![255; 32]), TxId(u64::MAX));
+                
+                self.eavt
+                    .range(start..end)
+                    .filter(|(key, _)| key.0 == *e && key.1 == *a)
+                    .filter(|(key, _)| {
+                        pattern.tx.map_or(true, |tx| key.3 == tx)
+                    })
+                    .map(|(_, datom)| datom.clone())
+                    .collect()
+            }
+            
+            // A-V (use AVET index for efficiency)
+            (None, Some(a), Some(v)) => {
+                let start = (*a, v.clone(), EntityId(0), TxId(0));
+                let end = (*a, v.clone(), EntityId(u64::MAX), TxId(u64::MAX));
+                
+                self.avet
+                    .range(start..=end)
+                    .filter(|(key, _)| {
+                        pattern.tx.map_or(true, |tx| key.3 == tx)
+                    })
+                    .map(|(_, datom)| datom.clone())
+                    .collect()
+            }
+            
+            // Just entity
+            (Some(e), None, None) => {
+                let start = (*e, AttributeId(0), Value::Boolean(false), TxId(0));
+                let end = (*e, AttributeId(u64::MAX), Value::Bytes(vec![255; 32]), TxId(u64::MAX));
+                
+                self.eavt
+                    .range(start..end)
+                    .filter(|(key, _)| key.0 == *e)
+                    .filter(|(key, _)| {
+                        pattern.tx.map_or(true, |tx| key.3 == tx)
+                    })
+                    .map(|(_, datom)| datom.clone())
+                    .collect()
+            }
+            
+            _ => Vec::new(),
+        }
+    }
+    
+    // Get all entities that reference a given entity
+    pub fn reverse_refs(&self, entity: EntityId) -> Vec<(EntityId, AttributeId)> {
+        let start = (entity, AttributeId(0), EntityId(0), TxId(0));
+        let end = (entity, AttributeId(u64::MAX), EntityId(u64::MAX), TxId(u64::MAX));
+        
+        self.vaet
+            .range(start..=end)
+            .filter(|(key, _)| key.0 == entity)
+            .map(|(key, _)| (key.2, key.1))
+            .collect()
+    }
+    
+    // Time travel - get database as of a specific transaction
+    pub fn as_of(&self, tx: TxId) -> DatabaseSnapshot {
+        let mut snapshot = DatabaseSnapshot::new();
+        
+        // Replay all transactions up to tx
+        for (txid, transaction) in &self.tx_log {
+            if *txid > tx {
+                break;
+            }
+            
+            for datom in &transaction.datoms {
+                match datom.op {
+                    Op::Assert => snapshot.assert_datom(datom.clone()),
+                    Op::Retract => snapshot.retract_datom(datom.clone()),
+                }
+            }
+        }
+        
+        snapshot
+    }
+}
+
+// ============================================================================
+// DATABASE SNAPSHOT - Point-in-time view
+// ============================================================================
+
+pub struct DatabaseSnapshot {
+    eavt: BTreeMap<(EntityId, AttributeId, Value, TxId), Datom>,
+}
+
+impl DatabaseSnapshot {
+    fn new() -> Self {
+        Self {
+            eavt: BTreeMap::new(),
+        }
+    }
+    
+    fn assert_datom(&mut self, datom: Datom) {
+        self.eavt.insert(
+            (datom.entity, datom.attribute, datom.value.clone(), datom.tx),
+            datom
+        );
+    }
+    
+    fn retract_datom(&mut self, datom: Datom) {
+        // Remove any existing assertions for this E-A-V
+        self.eavt.retain(|key, _| {
+            !(key.0 == datom.entity && 
+              key.1 == datom.attribute && 
+              key.2 == datom.value)
+        });
+    }
+    
+    pub fn get_entity(&self, entity: EntityId) -> Vec<Datom> {
+        let start = (entity, AttributeId(0), Value::Boolean(false), TxId(0));
+        let end = (entity, AttributeId(u64::MAX), Value::Bytes(vec![255; 32]), TxId(u64::MAX));
+        
+        self.eavt
+            .range(start..end)
+            .filter(|(key, _)| key.0 == entity)
+            .map(|(_, datom)| datom.clone())
+            .collect()
+    }
+}
+
+// ============================================================================
+// TRANSACTION - Unit of change
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transaction {
+    pub id: TxId,
+    pub pool: [u8; 32],
+    pub datoms: Vec<Datom>,
+    pub proposer: Did,
+    pub timestamp: u64,
+    pub parent_tx: Option<TxId>,
+    pub consensus_proof: ConsensusProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusProof {
+    pub votes: HashMap<Did, Vote>,
+    pub ordering_hash: [u8; 32],
+    pub achieved_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vote {
+    pub support: bool,
+    pub signature: Vec<u8>,
+    pub elaboration: String,
+}
+
+// ============================================================================
+// POOL DATABASE - Segregated temporal databases
+// ============================================================================
+
+pub struct PoolDatabase {
+    pub pool_id: [u8; 32],
+    pub db: TemporalDatabase,
+    pub pending_transactions: BTreeMap<TxId, Transaction>,
+    pub consensus_participants: HashSet<Did>,
+}
+
+impl PoolDatabase {
+    pub fn new(pool_id: [u8; 32]) -> Self {
+        Self {
+            pool_id,
+            db: TemporalDatabase::new(),
+            pending_transactions: BTreeMap::new(),
+            consensus_participants: HashSet::new(),
+        }
+    }
+    
+    pub fn propose_transaction(&mut self, tx: Transaction) -> Result<TxId, String> {
+        // Validate transaction
+        if tx.pool != self.pool_id {
+            return Err("Transaction pool mismatch".to_string());
+        }
+        
+        // Check parent exists if specified
+        if let Some(parent) = tx.parent_tx {
+            if !self.db.tx_log.contains_key(&parent) {
+                return Err("Parent transaction not found".to_string());
+            }
+        }
+        
+        // Add to pending
+        self.pending_transactions.insert(tx.id, tx.clone());
+        
+        Ok(tx.id)
+    }
+    
+    pub fn commit_transaction(&mut self, tx_id: TxId) -> Result<(), String> {
+        let tx = self.pending_transactions.remove(&tx_id)
+            .ok_or("Transaction not found in pending")?;
+        
+        // Verify consensus achieved
+        let support_count = tx.consensus_proof.votes
+            .values()
+            .filter(|v| v.support)
+            .count();
+        
+        let required = (self.consensus_participants.len() as f64 * 0.67).ceil() as usize;
+        
+        if support_count < required {
+            return Err(format!("Insufficient consensus: {} < {}", support_count, required));
+        }
+        
+        // Apply to database
+        self.db.apply_transaction(tx)?;
+        
+        Ok(())
+    }
+}
+
+// ============================================================================
+// INTEGRATION WITH YOUR AUTH SERVER
+// ============================================================================
+
+impl AuthClientActor {
+    // Add this method to handle data operations after authentication
+    fn handle_data_operation(&mut self, entity_id: EntityId, operation: DataOperation) {
+        match operation {
+            DataOperation::Assert { attribute, value } => {
+                // Create datom for assertion
+                let datom = Datom {
+                    entity: entity_id,
+                    attribute,
+                    value,
+                    tx: TxId(0), // Will be set by transaction processor
+                    op: Op::Assert,
+                };
+                
+                // Would send to pool database for consensus
+                println!("[DATA] Assert: {:?}", datom);
+            }
+            DataOperation::Query { patterns } => {
+                // Would query pool database
+                println!("[QUERY] Patterns: {:?}", patterns);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum DataOperation {
+    Assert { attribute: AttributeId, value: Value },
+    Query { patterns: Vec<Pattern> },
+}
+
+// ============================================================================
+// USAGE EXAMPLE
 // ============================================================================
 
 #[cfg(test)]
-mod client_example {
+mod tests {
     use super::*;
     
-    pub fn connect_to_server(server_addr: &str, pool_passphrase: &str) -> io::Result<()> {
-        // Load or create client identity
-        let client_identity = ServerIdentity::load_or_create("client")?;
-        Arc::get_mut(&mut client_identity.clone()).unwrap().set_pool(pool_passphrase);
+    #[test]
+    fn test_temporal_database() {
+        let mut db = TemporalDatabase::new();
         
-        // Connect to server
-        let mut stream = TcpStream::connect(server_addr)?;
-        
-        // Send Connect message
-        let connect_msg = AuthMessage::Connect(
-            client_identity.did.clone(),
-            client_identity.public_key.as_bytes().to_vec(),
-            client_identity.pool_commitment
-        );
-        write_auth_message(&mut stream, &connect_msg)?;
-        
-        // Receive challenge
-        let challenge_msg = read_auth_message(&mut stream)?;
-        
-        match challenge_msg {
-            AuthMessage::Challenge(nonce) => {
-                // Sign challenge
-                let signature = client_identity.sign(&nonce);
-                write_auth_message(&mut stream, &AuthMessage::Response(signature))?;
-                
-                // Send elaboration
-                let elaboration = "I am connecting to participate in the distributed knowledge network";
-                write_auth_message(&mut stream, &AuthMessage::Elaborate(elaboration.to_string()))?;
-                
-                // Wait for authentication result
-                let auth_result = read_auth_message(&mut stream)?;
-                
-                match auth_result {
-                    AuthMessage::Authenticated => {
-                        println!("[CLIENT] Authenticated successfully!");
-                        // Now can use regular TCP for application protocol
-                        Ok(())
-                    }
-                    AuthMessage::Rejected(reason) => {
-                        Err(io::Error::new(ErrorKind::PermissionDenied, reason))
-                    }
-                    _ => Err(io::Error::new(ErrorKind::InvalidData, "Unexpected response"))
-                }
-            }
-            AuthMessage::Rejected(reason) => {
-                Err(io::Error::new(ErrorKind::PermissionDenied, reason))
-            }
-            _ => Err(io::Error::new(ErrorKind::InvalidData, "Expected challenge"))
-        }
-    }
-}
-```
-
-# Actor Governance
-
-```rust
-// main.rs - Enhanced DIAGON Actor-Based P2P System
-// Replace entire main.rs content
-
-use std::{
-    thread,
-    sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, Ordering}},
-    net::{TcpStream, TcpListener, SocketAddr},
-    io::{Read, Write, ErrorKind},
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use pcap::{Device, Capture};
-use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
-
-// ============================================================================
-// CORE TYPES (from DIAGON)
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Did(pub String);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Cid(pub [u8; 32]);
-
-impl Cid {
-    pub fn short(&self) -> String {
-        hex::encode(&self.0[..8])
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entry {
-    pub cid: Cid,
-    pub entry_type: EntryType,
-    pub data: Vec<u8>,
-    pub creator: Did,
-    pub timestamp: u64,
-    pub signature: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EntryType {
-    Knowledge { category: String, concept: String, content: String },
-    Proposal { text: String },
-    Vote { target: Cid, support: bool },
-    Prune { target: Cid, reason: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Message {
-    Connect(Did, Vec<u8>, [u8; 32]),
-    Challenge([u8; 32]),
-    Response(Vec<u8>),
-    Elaborate(String),
-    Propose(Did, Entry, String),
-    Vote(Did, Cid, bool, String, Vec<u8>),
-    Heartbeat(Did),
-    Shutdown,
-}
-
-// ============================================================================
-// ACTOR MESSAGE TYPES WITH RESPONSE CHANNELS
-// ============================================================================
-
-pub enum SupervisorMsg {
-    ActorFailed(ActorType, String),
-    RestartActor(ActorType),
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-pub enum ActorType {
-    Network,
-    Governance,
-    Trust,
-    Storage,
-    Client(SocketAddr),
-}
-
-pub enum NetworkActorMsg {
-    StartListening(SocketAddr, mpsc::Sender<Result<(), String>>),
-    ConnectTo(SocketAddr, mpsc::Sender<Result<Did, String>>),
-    SendTo(Did, Message),
-    Broadcast(Message),
-    ClientConnected(TcpStream, SocketAddr),
-    ClientDisconnected(Did),
-    GetPeers(mpsc::Sender<Vec<Did>>),
-    Shutdown,
-}
-
-pub enum ClientActorMsg {
-    Authenticate(Did, Vec<u8>, [u8; 32]),
-    HandleMessage(Message),
-    SendMessage(Message),
-    GetState(mpsc::Sender<ClientState>),
-    Disconnect,
-}
-
-#[derive(Debug, Clone)]
-pub enum ClientState {
-    Connected,
-    Challenging([u8; 32]),
-    Authenticated(Did),
-    Disconnected,
-}
-
-pub enum GovernanceActorMsg {
-    CreateProposal(Did, EntryType, String, mpsc::Sender<Result<Cid, String>>),
-    CastVote(Did, Cid, bool, String, mpsc::Sender<Result<(), String>>),
-    GetProposal(Cid, mpsc::Sender<Option<Proposal>>),
-    CheckThresholds,
-    Shutdown,
-}
-
-pub enum TrustActorMsg {
-    UpdateTrust(Did, f64),
-    GetTrust(Did, mpsc::Sender<f64>),
-    DecayTrust,
-    Shutdown,
-}
-
-pub enum StorageActorMsg {
-    SaveEntry(Entry),
-    GetEntry(Cid, mpsc::Sender<Option<Entry>>),
-    SaveState(Vec<u8>),
-    LoadState(mpsc::Sender<Option<Vec<u8>>>),
-    Shutdown,
-}
-
-pub enum CaptureActorMsg {
-    Start(String),
-    Stop,
-}
-
-// ============================================================================
-// ACTOR HANDLES (following Alice Ryhl pattern)
-// ============================================================================
-
-#[derive(Clone)]
-pub struct SupervisorHandle {
-    sender: mpsc::Sender<SupervisorMsg>,
-}
-
-impl SupervisorHandle {
-    pub fn report_failure(&self, actor: ActorType, error: String) {
-        let _ = self.sender.send(SupervisorMsg::ActorFailed(actor, error));
-    }
-    
-    pub fn request_restart(&self, actor: ActorType) {
-        let _ = self.sender.send(SupervisorMsg::RestartActor(actor));
-    }
-}
-
-#[derive(Clone)]
-pub struct NetworkActorHandle {
-    sender: mpsc::Sender<NetworkActorMsg>,
-}
-
-impl NetworkActorHandle {
-    pub fn start_listening(&self, addr: SocketAddr) -> Result<(), String> {
-        let (tx, rx) = mpsc::channel();
-        self.sender.send(NetworkActorMsg::StartListening(addr, tx))
-            .map_err(|_| "Network actor dead".to_string())?;
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Timeout".to_string())?
-    }
-    
-    pub fn connect_to(&self, addr: SocketAddr) -> Result<Did, String> {
-        let (tx, rx) = mpsc::channel();
-        self.sender.send(NetworkActorMsg::ConnectTo(addr, tx))
-            .map_err(|_| "Network actor dead".to_string())?;
-        rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "Timeout".to_string())?
-    }
-    
-    pub fn broadcast(&self, msg: Message) {
-        let _ = self.sender.send(NetworkActorMsg::Broadcast(msg));
-    }
-    
-    pub fn get_peers(&self) -> Vec<Did> {
-        let (tx, rx) = mpsc::channel();
-        if self.sender.send(NetworkActorMsg::GetPeers(tx)).is_ok() {
-            rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ClientActorHandle {
-    sender: mpsc::Sender<ClientActorMsg>,
-}
-
-impl ClientActorHandle {
-    pub fn send_message(&self, msg: Message) {
-        let _ = self.sender.send(ClientActorMsg::SendMessage(msg));
-    }
-    
-    pub fn get_state(&self) -> Option<ClientState> {
-        let (tx, rx) = mpsc::channel();
-        self.sender.send(ClientActorMsg::GetState(tx)).ok()?;
-        rx.recv_timeout(Duration::from_secs(1)).ok()
-    }
-    
-    pub fn disconnect(&self) {
-        let _ = self.sender.send(ClientActorMsg::Disconnect);
-    }
-}
-
-#[derive(Clone)]
-pub struct GovernanceActorHandle {
-    sender: mpsc::Sender<GovernanceActorMsg>,
-}
-
-impl GovernanceActorHandle {
-    pub fn create_proposal(&self, did: Did, entry: EntryType, elaboration: String) -> Result<Cid, String> {
-        let (tx, rx) = mpsc::channel();
-        self.sender.send(GovernanceActorMsg::CreateProposal(did, entry, elaboration, tx))
-            .map_err(|_| "Governance actor dead".to_string())?;
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Timeout".to_string())?
-    }
-    
-    pub fn cast_vote(&self, did: Did, cid: Cid, support: bool, elaboration: String) -> Result<(), String> {
-        let (tx, rx) = mpsc::channel();
-        self.sender.send(GovernanceActorMsg::CastVote(did, cid, support, elaboration, tx))
-            .map_err(|_| "Governance actor dead".to_string())?;
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Timeout".to_string())?
-    }
-}
-
-#[derive(Clone)]
-pub struct TrustActorHandle {
-    sender: mpsc::Sender<TrustActorMsg>,
-}
-
-impl TrustActorHandle {
-    pub fn update_trust(&self, did: Did, delta: f64) {
-        let _ = self.sender.send(TrustActorMsg::UpdateTrust(did, delta));
-    }
-    
-    pub fn get_trust(&self, did: Did) -> f64 {
-        let (tx, rx) = mpsc::channel();
-        if self.sender.send(TrustActorMsg::GetTrust(did, tx)).is_ok() {
-            rx.recv_timeout(Duration::from_secs(1)).unwrap_or(0.5)
-        } else {
-            0.5
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct StorageActorHandle {
-    sender: mpsc::Sender<StorageActorMsg>,
-}
-
-impl StorageActorHandle {
-    pub fn save_entry(&self, entry: Entry) {
-        let _ = self.sender.send(StorageActorMsg::SaveEntry(entry));
-    }
-    
-    pub fn get_entry(&self, cid: Cid) -> Option<Entry> {
-        let (tx, rx) = mpsc::channel();
-        self.sender.send(StorageActorMsg::GetEntry(cid, tx)).ok()?;
-        rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
-    }
-}
-
-#[derive(Clone)]
-pub struct CaptureActorHandle {
-    sender: mpsc::Sender<CaptureActorMsg>,
-}
-
-impl CaptureActorHandle {
-    pub fn start(&self, interface: String) {
-        let _ = self.sender.send(CaptureActorMsg::Start(interface));
-    }
-    
-    pub fn stop(&self) {
-        let _ = self.sender.send(CaptureActorMsg::Stop);
-    }
-}
-
-// ============================================================================
-// SUPERVISOR ACTOR
-// ============================================================================
-
-struct SupervisorActor {
-    receiver: mpsc::Receiver<SupervisorMsg>,
-    network: Option<NetworkActorHandle>,
-    governance: Option<GovernanceActorHandle>,
-    trust: Option<TrustActorHandle>,
-    storage: Option<StorageActorHandle>,
-    running: Arc<AtomicBool>,
-}
-
-impl SupervisorActor {
-    fn new(receiver: mpsc::Receiver<SupervisorMsg>, running: Arc<AtomicBool>) -> Self {
-        Self {
-            receiver,
-            network: None,
-            governance: None,
-            trust: None,
-            storage: None,
-            running,
-        }
-    }
-    
-    fn run(mut self) {
-        println!("[SUPERVISOR] Started");
-        
-        // Start child actors
-        self.network = Some(Self::spawn_network_actor(self.running.clone()));
-        self.governance = Some(Self::spawn_governance_actor(self.running.clone()));
-        self.trust = Some(Self::spawn_trust_actor(self.running.clone()));
-        self.storage = Some(Self::spawn_storage_actor(self.running.clone()));
-        
-        while let Ok(msg) = self.receiver.recv() {
-            match msg {
-                SupervisorMsg::ActorFailed(actor_type, error) => {
-                    println!("[SUPERVISOR] Actor failed: {:?} - {}", actor_type, error);
-                    self.handle_actor_failure(actor_type);
-                }
-                SupervisorMsg::RestartActor(actor_type) => {
-                    println!("[SUPERVISOR] Restarting actor: {:?}", actor_type);
-                    self.restart_actor(actor_type);
-                }
-                SupervisorMsg::Shutdown => {
-                    println!("[SUPERVISOR] Shutting down");
-                    self.shutdown_all();
-                    break;
-                }
-            }
-        }
-        
-        println!("[SUPERVISOR] Exited");
-    }
-    
-    fn handle_actor_failure(&mut self, actor_type: ActorType) {
-        // Implement restart policy
-        match actor_type {
-            ActorType::Network => {
-                println!("[SUPERVISOR] Critical failure: Network actor");
-                self.shutdown_all();
-            }
-            ActorType::Governance | ActorType::Trust | ActorType::Storage => {
-                self.restart_actor(actor_type);
-            }
-            ActorType::Client(_) => {
-                // Client failures don't require restart
-            }
-        }
-    }
-    
-    fn restart_actor(&mut self, actor_type: ActorType) {
-        match actor_type {
-            ActorType::Governance => {
-                self.governance = Some(Self::spawn_governance_actor(self.running.clone()));
-            }
-            ActorType::Trust => {
-                self.trust = Some(Self::spawn_trust_actor(self.running.clone()));
-            }
-            ActorType::Storage => {
-                self.storage = Some(Self::spawn_storage_actor(self.running.clone()));
-            }
-            _ => {}
-        }
-    }
-    
-    fn shutdown_all(&self) {
-        self.running.store(false, Ordering::Relaxed);
-        // Actors will check running flag and exit
-    }
-    
-    fn spawn_network_actor(running: Arc<AtomicBool>) -> NetworkActorHandle {
-        let (tx, rx) = mpsc::channel();
-        let actor = NetworkActor::new(rx, running);
-        thread::spawn(move || actor.run());
-        NetworkActorHandle { sender: tx }
-    }
-    
-    fn spawn_governance_actor(running: Arc<AtomicBool>) -> GovernanceActorHandle {
-        let (tx, rx) = mpsc::channel();
-        let actor = GovernanceActor::new(rx, running);
-        thread::spawn(move || actor.run());
-        GovernanceActorHandle { sender: tx }
-    }
-    
-    fn spawn_trust_actor(running: Arc<AtomicBool>) -> TrustActorHandle {
-        let (tx, rx) = mpsc::channel();
-        let actor = TrustActor::new(rx, running);
-        thread::spawn(move || actor.run());
-        TrustActorHandle { sender: tx }
-    }
-    
-    fn spawn_storage_actor(running: Arc<AtomicBool>) -> StorageActorHandle {
-        let (tx, rx) = mpsc::channel();
-        let actor = StorageActor::new(rx, running);
-        thread::spawn(move || actor.run());
-        StorageActorHandle { sender: tx }
-    }
-}
-
-// ============================================================================
-// NETWORK ACTOR
-// ============================================================================
-
-struct NetworkActor {
-    receiver: mpsc::Receiver<NetworkActorMsg>,
-    listener: Option<TcpListener>,
-    clients: HashMap<Did, ClientActorHandle>,
-    running: Arc<AtomicBool>,
-}
-
-impl NetworkActor {
-    fn new(receiver: mpsc::Receiver<NetworkActorMsg>, running: Arc<AtomicBool>) -> Self {
-        Self {
-            receiver,
-            listener: None,
-            clients: HashMap::new(),
-            running,
-        }
-    }
-    
-    fn run(mut self) {
-        println!("[NETWORK] Started");
-        
-        loop {
-            // Check for shutdown
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            // Handle messages with timeout to allow checking running flag
-            match self.receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(msg) => self.handle_message(msg),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Check for incoming connections if listening
-                    self.accept_connections();
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        
-        // Cleanup
-        for (_, client) in self.clients.drain() {
-            client.disconnect();
-        }
-        
-        println!("[NETWORK] Exited");
-    }
-    
-    fn handle_message(&mut self, msg: NetworkActorMsg) {
-        match msg {
-            NetworkActorMsg::StartListening(addr, reply) => {
-                let result = TcpListener::bind(addr)
-                    .and_then(|l| {
-                        l.set_nonblocking(true)?;
-                        Ok(l)
-                    })
-                    .map(|l| {
-                        self.listener = Some(l);
-                        println!("[NETWORK] Listening on {}", addr);
-                    })
-                    .map_err(|e| e.to_string());
-                let _ = reply.send(result);
-            }
-            NetworkActorMsg::ConnectTo(addr, reply) => {
-                let result = self.connect_to_peer(addr);
-                let _ = reply.send(result);
-            }
-            NetworkActorMsg::SendTo(did, msg) => {
-                if let Some(client) = self.clients.get(&did) {
-                    client.send_message(msg);
-                }
-            }
-            NetworkActorMsg::Broadcast(msg) => {
-                for client in self.clients.values() {
-                    client.send_message(msg.clone());
-                }
-            }
-            NetworkActorMsg::ClientConnected(stream, addr) => {
-                self.handle_new_connection(stream, addr);
-            }
-            NetworkActorMsg::ClientDisconnected(did) => {
-                self.clients.remove(&did);
-                println!("[NETWORK] Client disconnected: {}", did.0);
-            }
-            NetworkActorMsg::GetPeers(reply) => {
-                let peers: Vec<Did> = self.clients.keys().cloned().collect();
-                let _ = reply.send(peers);
-            }
-            NetworkActorMsg::Shutdown => {
-                self.running.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-    
-    fn accept_connections(&mut self) {
-        if let Some(listener) = &self.listener {
-            match listener.accept() {
-                Ok((stream, addr)) => {
-                    self.handle_new_connection(stream, addr);
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // No connections ready
-                }
-                Err(e) => {
-                    eprintln!("[NETWORK] Accept error: {}", e);
-                }
-            }
-        }
-    }
-    
-    fn handle_new_connection(&mut self, stream: TcpStream, addr: SocketAddr) {
-        let (tx, rx) = mpsc::channel();
-        let handle = ClientActorHandle { sender: tx };
-        
-        // Temporary DID until authenticated
-        let temp_did = Did(format!("temp:{}", addr));
-        self.clients.insert(temp_did.clone(), handle.clone());
-        
-        let actor = ClientActor::new(rx, stream, addr, self.running.clone());
-        thread::spawn(move || actor.run());
-        
-        println!("[NETWORK] New connection from {}", addr);
-    }
-    
-    fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<Did, String> {
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
-            .map_err(|e| e.to_string())?;
-        
-        let (tx, rx) = mpsc::channel();
-        let handle = ClientActorHandle { sender: tx };
-        
-        let temp_did = Did(format!("temp:{}", addr));
-        self.clients.insert(temp_did.clone(), handle);
-        
-        let actor = ClientActor::new(rx, stream, addr, self.running.clone());
-        thread::spawn(move || actor.run());
-        
-        Ok(temp_did)
-    }
-}
-
-// ============================================================================
-// CLIENT ACTOR
-// ============================================================================
-
-struct ClientActor {
-    receiver: mpsc::Receiver<ClientActorMsg>,
-    stream: TcpStream,
-    peer_addr: SocketAddr,
-    state: ClientState,
-    buffer: Vec<u8>,
-    running: Arc<AtomicBool>,
-}
-
-impl ClientActor {
-    fn new(
-        receiver: mpsc::Receiver<ClientActorMsg>,
-        stream: TcpStream,
-        peer_addr: SocketAddr,
-        running: Arc<AtomicBool>,
-    ) -> Self {
-        let _ = stream.set_nonblocking(true);
-        Self {
-            receiver,
-            stream,
-            peer_addr,
-            state: ClientState::Connected,
-            buffer: vec![0; 65536],
-            running,
-        }
-    }
-    
-    fn run(mut self) {
-        println!("[CLIENT] Actor started for {}", self.peer_addr);
-        
-        loop {
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            // Check for actor messages
-            match self.receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(msg) => {
-                    if !self.handle_message(msg) {
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            
-            // Try to read from socket
-            match self.stream.read(&mut self.buffer) {
-                Ok(0) => {
-                    println!("[CLIENT] Connection closed by {}", self.peer_addr);
-                    break;
-                }
-                Ok(n) => {
-                    self.process_data(&self.buffer[..n].to_vec());
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    eprintln!("[CLIENT] Read error from {}: {}", self.peer_addr, e);
-                    break;
-                }
-            }
-        }
-        
-        println!("[CLIENT] Actor exited for {}", self.peer_addr);
-    }
-    
-    fn handle_message(&mut self, msg: ClientActorMsg) -> bool {
-        match msg {
-            ClientActorMsg::Authenticate(did, pubkey, pool) => {
-                self.state = ClientState::Authenticated(did.clone());
-                println!("[CLIENT] Authenticated as {}", did.0);
-                true
-            }
-            ClientActorMsg::HandleMessage(msg) => {
-                self.handle_protocol_message(msg);
-                true
-            }
-            ClientActorMsg::SendMessage(msg) => {
-                self.send_message(msg);
-                true
-            }
-            ClientActorMsg::GetState(reply) => {
-                let _ = reply.send(self.state.clone());
-                true
-            }
-            ClientActorMsg::Disconnect => {
-                println!("[CLIENT] Disconnecting {}", self.peer_addr);
-                false
-            }
-        }
-    }
-    
-    fn process_data(&mut self, data: &[u8]) {
-        // Parse DIAGON message from data
-        if data.len() >= 4 {
-            let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            if data.len() >= 4 + len {
-                if let Ok(msg) = bincode::deserialize::<Message>(&data[4..4+len]) {
-                    self.handle_protocol_message(msg);
-                }
-            }
-        }
-    }
-    
-    fn handle_protocol_message(&mut self, msg: Message) {
-        println!("[CLIENT] Received {:?} from {}", 
-                 std::mem::discriminant(&msg), self.peer_addr);
-        
-        match msg {
-            Message::Connect(did, pubkey, pool) => {
-                // Send challenge
-                let mut challenge = [0u8; 32];
-                self.state = ClientState::Challenging(challenge);
-                self.send_message(Message::Challenge(challenge));
-            }
-            Message::Challenge(challenge) => {
-                // Would sign challenge here
-                self.send_message(Message::Response(vec![]));
-            }
-            Message::Response(signature) => {
-                // Verify signature and authenticate
-                if let ClientState::Challenging(_) = self.state {
-                    // Would verify signature here
-                    println!("[CLIENT] Authentication successful");
-                }
-            }
-            Message::Elaborate(text) => {
-                println!("[CLIENT] Elaboration: {}", text);
-            }
-            _ => {}
-        }
-    }
-    
-    fn send_message(&mut self, msg: Message) {
-        if let Ok(data) = bincode::serialize(&msg) {
-            let len = (data.len() as u32).to_be_bytes();
-            let _ = self.stream.write_all(&len);
-            let _ = self.stream.write_all(&data);
-            let _ = self.stream.flush();
-        }
-    }
-}
-
-// ============================================================================
-// GOVERNANCE ACTOR
-// ============================================================================
-
-#[derive(Clone)]
-struct Proposal {
-    cid: Cid,
-    entry_type: EntryType,
-    proposer: Did,
-    elaboration: String,
-    votes_for: HashSet<Did>,
-    votes_against: HashSet<Did>,
-    executed: bool,
-}
-
-struct GovernanceActor {
-    receiver: mpsc::Receiver<GovernanceActorMsg>,
-    proposals: HashMap<Cid, Proposal>,
-    running: Arc<AtomicBool>,
-}
-
-impl GovernanceActor {
-    fn new(receiver: mpsc::Receiver<GovernanceActorMsg>, running: Arc<AtomicBool>) -> Self {
-        Self {
-            receiver,
-            proposals: HashMap::new(),
-            running,
-        }
-    }
-    
-    fn run(mut self) {
-        println!("[GOVERNANCE] Started");
-        
-        while let Ok(msg) = self.receiver.recv() {
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            match msg {
-                GovernanceActorMsg::CreateProposal(did, entry_type, elaboration, reply) => {
-                    let cid = self.create_proposal(did, entry_type, elaboration);
-                    let _ = reply.send(Ok(cid));
-                }
-                GovernanceActorMsg::CastVote(did, cid, support, elaboration, reply) => {
-                    let result = self.cast_vote(did, cid, support, elaboration);
-                    let _ = reply.send(result);
-                }
-                GovernanceActorMsg::GetProposal(cid, reply) => {
-                    let _ = reply.send(self.proposals.get(&cid).cloned());
-                }
-                GovernanceActorMsg::CheckThresholds => {
-                    self.check_execution_thresholds();
-                }
-                GovernanceActorMsg::Shutdown => break,
-            }
-        }
-        
-        println!("[GOVERNANCE] Exited");
-    }
-    
-    fn create_proposal(&mut self, did: Did, entry_type: EntryType, elaboration: String) -> Cid {
-        let mut hasher = Sha256::new();
-        hasher.update(elaboration.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let cid = Cid(hash);
-        
-        self.proposals.insert(cid, Proposal {
-            cid,
-            entry_type,
-            proposer: did,
-            elaboration,
-            votes_for: HashSet::new(),
-            votes_against: HashSet::new(),
-            executed: false,
-        });
-        
-        println!("[GOVERNANCE] Created proposal {}", cid.short());
-        cid
-    }
-    
-    fn cast_vote(&mut self, did: Did, cid: Cid, support: bool, _elaboration: String) -> Result<(), String> {
-        let proposal = self.proposals.get_mut(&cid)
-            .ok_or("Proposal not found")?;
-        
-        if support {
-            proposal.votes_for.insert(did);
-        } else {
-            proposal.votes_against.insert(did);
-        }
-        
-        println!("[GOVERNANCE] Vote cast on {}: {}", cid.short(), support);
-        Ok(())
-    }
-    
-    fn check_execution_thresholds(&mut self) {
-        for proposal in self.proposals.values_mut() {
-            if !proposal.executed && proposal.votes_for.len() >= 2 {
-                proposal.executed = true;
-                println!("[GOVERNANCE] Executed proposal {}", proposal.cid.short());
-            }
-        }
-    }
-}
-
-// ============================================================================
-// TRUST ACTOR
-// ============================================================================
-
-struct TrustActor {
-    receiver: mpsc::Receiver<TrustActorMsg>,
-    scores: HashMap<Did, f64>,
-    running: Arc<AtomicBool>,
-}
-
-impl TrustActor {
-    fn new(receiver: mpsc::Receiver<TrustActorMsg>, running: Arc<AtomicBool>) -> Self {
-        Self {
-            receiver,
-            scores: HashMap::new(),
-            running,
-        }
-    }
-    
-    fn run(mut self) {
-        println!("[TRUST] Started");
-        
-        while let Ok(msg) = self.receiver.recv() {
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            match msg {
-                TrustActorMsg::UpdateTrust(did, delta) => {
-                    let score = self.scores.entry(did.clone()).or_insert(0.5);
-                    *score = (*score + delta).max(0.0).min(1.0);
-                    println!("[TRUST] Updated {} to {:.2}", did.0, score);
-                }
-                TrustActorMsg::GetTrust(did, reply) => {
-                    let score = self.scores.get(&did).copied().unwrap_or(0.5);
-                    let _ = reply.send(score);
-                }
-                TrustActorMsg::DecayTrust => {
-                    for score in self.scores.values_mut() {
-                        *score *= 0.95;
-                    }
-                    println!("[TRUST] Applied decay");
-                }
-                TrustActorMsg::Shutdown => break,
-            }
-        }
-        
-        println!("[TRUST] Exited");
-    }
-}
-
-// ============================================================================
-// STORAGE ACTOR
-// ============================================================================
-
-struct StorageActor {
-    receiver: mpsc::Receiver<StorageActorMsg>,
-    entries: HashMap<Cid, Entry>,
-    running: Arc<AtomicBool>,
-}
-
-impl StorageActor {
-    fn new(receiver: mpsc::Receiver<StorageActorMsg>, running: Arc<AtomicBool>) -> Self {
-        Self {
-            receiver,
-            entries: HashMap::new(),
-            running,
-        }
-    }
-    
-    fn run(mut self) {
-        println!("[STORAGE] Started");
-        
-        while let Ok(msg) = self.receiver.recv() {
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            match msg {
-                StorageActorMsg::SaveEntry(entry) => {
-                    println!("[STORAGE] Saved entry {}", entry.cid.short());
-                    self.entries.insert(entry.cid, entry);
-                }
-                StorageActorMsg::GetEntry(cid, reply) => {
-                    let _ = reply.send(self.entries.get(&cid).cloned());
-                }
-                StorageActorMsg::SaveState(data) => {
-                    println!("[STORAGE] Saved state ({} bytes)", data.len());
-                }
-                StorageActorMsg::LoadState(reply) => {
-                    let _ = reply.send(None); // Would load from disk
-                }
-                StorageActorMsg::Shutdown => break,
-            }
-        }
-        
-        println!("[STORAGE] Exited");
-    }
-}
-
-// ============================================================================
-// PACKET CAPTURE ACTOR
-// ============================================================================
-
-struct CaptureActor {
-    receiver: mpsc::Receiver<CaptureActorMsg>,
-}
-
-impl CaptureActor {
-    fn run(mut self) {
-        while let Ok(msg) = self.receiver.recv() {
-            match msg {
-                CaptureActorMsg::Start(interface) => {
-                    self.capture_packets(&interface);
-                }
-                CaptureActorMsg::Stop => break,
-            }
-        }
-    }
-    
-    fn capture_packets(&mut self, interface: &str) {
-        let devices = match Device::list() {
-            Ok(devs) => devs,
-            Err(e) => {
-                eprintln!("[CAPTURE] Failed to list devices: {}", e);
-                return;
-            }
+        // Create a transaction
+        let mut tx = Transaction {
+            id: db.allocate_tx_id(),
+            pool: [0; 32],
+            datoms: vec![],
+            proposer: Did("did:test:123".to_string()),
+            timestamp: current_timestamp(),
+            parent_tx: None,
+            consensus_proof: ConsensusProof {
+                votes: HashMap::new(),
+                ordering_hash: [0; 32],
+                achieved_at: current_timestamp(),
+            },
         };
         
-        let device = devices.iter()
-            .find(|d| d.name == interface || 
-                      d.desc.as_ref().map(|s| s.contains(interface)).unwrap_or(false))
-            .cloned()
-            .unwrap_or_else(|| devices[0].clone());
+        // Add some datoms
+        let entity = db.allocate_entity_id();
         
-        println!("[CAPTURE] Using device: {}", device.name);
+        tx.datoms.push(Datom {
+            entity,
+            attribute: AttributeId(100), // user/did
+            value: Value::String("did:test:alice".to_string()),
+            tx: tx.id,
+            op: Op::Assert,
+        });
         
-        let mut cap = match Capture::from_device(device)
-            .unwrap()
-            .promisc(true)
-            .snaplen(65535)
-            .timeout(1000)
-            .open()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[CAPTURE] Failed to open: {}", e);
-                return;
+        tx.datoms.push(Datom {
+            entity,
+            attribute: AttributeId(102), // user/trust
+            value: Value::double(0.75),
+            tx: tx.id,
+            op: Op::Assert,
+        });
+        
+        // Apply transaction
+        db.apply_transaction(tx).unwrap();
+        
+        // Query by attribute and value
+        let results = db.query(vec![
+            Pattern {
+                entity: None,
+                attribute: Some(AttributeId(100)),
+                value: Some(Value::String("did:test:alice".to_string())),
+                tx: None,
             }
-        };
+        ]);
         
-        let _ = cap.filter("tcp port 9090", true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entity, entity);
         
-        loop {
-            match self.receiver.try_recv() {
-                Ok(CaptureActorMsg::Stop) => break,
-                _ => {}
-            }
-            
-            match cap.next_packet() {
-                Ok(packet) => self.parse_packet(&packet.data),
-                Err(pcap::Error::TimeoutExpired) => continue,
-                Err(e) => {
-                    eprintln!("[CAPTURE] Error: {}", e);
-                    break;
-                }
-            }
-        }
+        // Time travel query
+        let snapshot = db.as_of(TxId(999)); // Before our transaction
+        assert_eq!(snapshot.get_entity(entity).len(), 0);
+        
+        let snapshot = db.as_of(TxId(1001)); // After our transaction
+        assert_eq!(snapshot.get_entity(entity).len(), 2);
     }
-    
-    fn parse_packet(&self, packet: &[u8]) {
-        if packet.len() < 54 { return; }
-        
-        // Parse headers (simplified)
-        let ip_offset = 14; // Ethernet header
-        let ip_header_len = ((packet[ip_offset] & 0x0F) * 4) as usize;
-        let tcp_offset = ip_offset + ip_header_len;
-        
-        if packet.len() < tcp_offset + 20 { return; }
-        
-        let src_port = u16::from_be_bytes([packet[tcp_offset], packet[tcp_offset + 1]]);
-        let dst_port = u16::from_be_bytes([packet[tcp_offset + 2], packet[tcp_offset + 3]]);
-        
-        let tcp_header_len = ((packet[tcp_offset + 12] >> 4) * 4) as usize;
-        let payload_offset = tcp_offset + tcp_header_len;
-        
-        if payload_offset < packet.len() {
-            let payload = &packet[payload_offset..];
-            
-            // Try to parse DIAGON message
-            if payload.len() >= 4 {
-                let len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-                if payload.len() >= 4 + len {
-                    if let Ok(msg) = bincode::deserialize::<Message>(&payload[4..4+len]) {
-                        println!("[CAPTURE] DIAGON {:?} on {}->{}",
-                                 std::mem::discriminant(&msg), src_port, dst_port);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ============================================================================
-// NODE API
-// ============================================================================
-
-pub struct Node {
-    supervisor: SupervisorHandle,
-    network: NetworkActorHandle,
-    governance: GovernanceActorHandle,
-    trust: TrustActorHandle,
-    storage: StorageActorHandle,
-    capture: Option<CaptureActorHandle>,
-    running: Arc<AtomicBool>,
-}
-
-impl Node {
-    pub fn new() -> Arc<Self> {
-        let running = Arc::new(AtomicBool::new(true));
-        
-        // Create supervisor
-        let (sup_tx, sup_rx) = mpsc::channel();
-        let supervisor = SupervisorHandle { sender: sup_tx };
-        
-        // Create actor handles (supervisor will spawn them)
-        let (net_tx, net_rx) = mpsc::channel();
-        let (gov_tx, gov_rx) = mpsc::channel();
-        let (trust_tx, trust_rx) = mpsc::channel();
-        let (stor_tx, stor_rx) = mpsc::channel();
-        
-        let network = NetworkActorHandle { sender: net_tx };
-        let governance = GovernanceActorHandle { sender: gov_tx };
-        let trust = TrustActorHandle { sender: trust_tx };
-        let storage = StorageActorHandle { sender: stor_tx };
-        
-        // Start supervisor
-        let sup_running = running.clone();
-        thread::spawn(move || {
-            let supervisor = SupervisorActor::new(sup_rx, sup_running);
-            supervisor.run();
-        });
-        
-        // Start actors
-        let net_running = running.clone();
-        thread::spawn(move || {
-            let actor = NetworkActor::new(net_rx, net_running);
-            actor.run();
-        });
-        
-        let gov_running = running.clone();
-        thread::spawn(move || {
-            let actor = GovernanceActor::new(gov_rx, gov_running);
-            actor.run();
-        });
-        
-        let trust_running = running.clone();
-        thread::spawn(move || {
-            let actor = TrustActor::new(trust_rx, trust_running);
-            actor.run();
-        });
-        
-        let stor_running = running.clone();
-        thread::spawn(move || {
-            let actor = StorageActor::new(stor_rx, stor_running);
-            actor.run();
-        });
-        
-        // Optional packet capture
-        let capture = if std::env::var("ENABLE_PCAP").is_ok() {
-            let (cap_tx, cap_rx) = mpsc::channel();
-            thread::spawn(move || {
-                let actor = CaptureActor { receiver: cap_rx };
-                actor.run();
-            });
-            Some(CaptureActorHandle { sender: cap_tx })
-        } else {
-            None
-        };
-        
-        Arc::new(Self {
-            supervisor,
-            network,
-            governance,
-            trust,
-            storage,
-            capture,
-            running,
-        })
-    }
-    
-    pub fn listen(&self, addr: &str) -> Result<(), String> {
-        let socket_addr: SocketAddr = addr.parse()
-            .map_err(|_| "Invalid address")?;
-        self.network.start_listening(socket_addr)
-    }
-    
-    pub fn connect(&self, addr: &str) -> Result<Did, String> {
-        let socket_addr: SocketAddr = addr.parse()
-            .map_err(|_| "Invalid address")?;
-        self.network.connect_to(socket_addr)
-    }
-    
-    pub fn elaborate(&self, text: &str) {
-        self.network.broadcast(Message::Elaborate(text.to_string()));
-    }
-    
-    pub fn propose(&self, did: Did, entry_type: EntryType, elaboration: String) -> Result<Cid, String> {
-        self.governance.create_proposal(did, entry_type, elaboration)
-    }
-    
-    pub fn vote(&self, did: Did, cid: Cid, support: bool, elaboration: String) -> Result<(), String> {
-        self.governance.cast_vote(did, cid, support, elaboration)
-    }
-    
-    pub fn get_trust(&self, did: Did) -> f64 {
-        self.trust.get_trust(did)
-    }
-    
-    pub fn get_peers(&self) -> Vec<Did> {
-        self.network.get_peers()
-    }
-    
-    pub fn enable_capture(&self, interface: &str) {
-        if let Some(capture) = &self.capture {
-            capture.start(interface.to_string());
-        }
-    }
-    
-    pub fn shutdown(&self) {
-        println!("[NODE] Initiating shutdown");
-        self.running.store(false, Ordering::Relaxed);
-        self.supervisor.sender.send(SupervisorMsg::Shutdown).ok();
-        thread::sleep(Duration::from_secs(1));
-        println!("[NODE] Shutdown complete");
-    }
-}
-
-// ============================================================================
-// MAIN
-// ============================================================================
-
-fn main() {
-    println!("DIAGON - Actor-Based P2P Governance System");
-    println!("=========================================\n");
-    
-    let node = Node::new();
-    
-    // Start listening
-    if let Err(e) = node.listen("0.0.0.0:9090") {
-        eprintln!("Failed to start listening: {}", e);
-        return;
-    }
-    
-    // Enable packet capture if requested
-    if std::env::var("ENABLE_PCAP").is_ok() {
-        let interface = std::env::var("PCAP_INTERFACE")
-            .unwrap_or_else(|_| "lo".to_string());
-        node.enable_capture(&interface);
-    }
-    
-    // Run until interrupted
-    println!("Node running. Press Ctrl+C to shutdown.\n");
-    
-    // Simple command loop for testing
-    loop {
-        thread::sleep(Duration::from_secs(10));
-        
-        // Check if we should shutdown
-        if !node.running.load(Ordering::Relaxed) {
-            break;
-        }
-        
-        // Example: broadcast elaboration
-        node.elaborate("Periodic trust building elaboration");
-        
-        // Show peer count
-        let peers = node.get_peers();
-        println!("Connected peers: {}", peers.len());
-    }
-    
-    node.shutdown();
 }
 ```
