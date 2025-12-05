@@ -204,316 +204,68 @@ but may not reflect all actions.
 it commits
 - Agents are not Actors (Erlang/Scala)
 
-# The Datomic Model 
+# Actor Governance
 
 ```rust
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
+// main.rs - Enhanced DIAGON Actor-Based P2P System
+// Replace entire main.rs content
+
+use std::{
+    thread,
+    sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    net::{TcpStream, TcpListener, SocketAddr},
+    io::{Read, Write, ErrorKind},
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use pcap::{Device, Capture};
+use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
 
 // ============================================================================
-// DATOM MODEL - The Core of Datomic
+// CORE TYPES (from DIAGON)
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct EntityId(pub u64);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Did(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct AttributeId(pub u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Cid(pub [u8; 32]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct TxId(pub u64);
-
-impl TxId {
-    pub fn to_entity_id(&self) -> EntityId {
-        EntityId(self.0)
+impl Cid {
+    pub fn short(&self) -> String {
+        hex::encode(&self.0[..8])
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Value {
-    Boolean(bool),
-    Long(i64),
-    String(String),
-    Ref(EntityId),
-    Instant(u64),
-    Bytes(Vec<u8>),
-    Double([u8; 8]), // Store as bytes for Ord trait
-}
-
-impl Value {
-    pub fn double(f: f64) -> Self {
-        Value::Double(f.to_bits().to_be_bytes())
-    }
-    
-    pub fn get_double(&self) -> Option<f64> {
-        match self {
-            Value::Double(bytes) => Some(f64::from_bits(u64::from_be_bytes(*bytes))),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Op {
-    Assert,
-    Retract,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Datom {
-    pub entity: EntityId,
-    pub attribute: AttributeId,
-    pub value: Value,
-    pub tx: TxId,
-    pub op: Op,
+pub struct Entry {
+    pub cid: Cid,
+    pub entry_type: EntryType,
+    pub data: Vec<u8>,
+    pub creator: Did,
+    pub timestamp: u64,
+    pub signature: Vec<u8>,
 }
-
-// ============================================================================
-// SCHEMA - Define attributes and their properties
-// ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attribute {
-    pub id: AttributeId,
-    pub ident: String,
-    pub value_type: ValueType,
-    pub cardinality: Cardinality,
-    pub indexed: bool,
-    pub unique: Option<Uniqueness>,
+pub enum EntryType {
+    Knowledge { category: String, concept: String, content: String },
+    Proposal { text: String },
+    Vote { target: Cid, support: bool },
+    Prune { target: Cid, reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ValueType {
-    Boolean,
-    Long,
-    String,
-    Ref,
-    Instant,
-    Bytes,
-    Double,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Cardinality {
-    One,
-    Many,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Uniqueness {
-    Value,
-    Identity,
-}
-
-// ============================================================================
-// TEMPORAL DATABASE - The heart of Datomic
-// ============================================================================
-
-pub struct TemporalDatabase {
-    // The four indexes that make Datomic queries fast
-    eavt: BTreeMap<(EntityId, AttributeId, Value, TxId), Datom>,
-    aevt: BTreeMap<(AttributeId, EntityId, Value, TxId), Datom>,
-    avet: BTreeMap<(AttributeId, Value, EntityId, TxId), Datom>,
-    vaet: BTreeMap<(EntityId, AttributeId, EntityId, TxId), ()>, // For ref lookups
-    
-    // Transaction log - the source of truth
-    tx_log: BTreeMap<TxId, Transaction>,
-    
-    // Schema
-    schema: HashMap<AttributeId, Attribute>,
-    schema_by_ident: HashMap<String, AttributeId>,
-    
-    // Entity ID allocation
-    next_entity_id: u64,
-    next_tx_id: u64,
-}
-
-impl TemporalDatabase {
-    pub fn new() -> Self {
-        let mut db = Self {
-            eavt: BTreeMap::new(),
-            aevt: BTreeMap::new(),
-            avet: BTreeMap::new(),
-            vaet: BTreeMap::new(),
-            tx_log: BTreeMap::new(),
-            schema: HashMap::new(),
-            schema_by_ident: HashMap::new(),
-            next_entity_id: 1000, // Reserve lower IDs for system entities
-            next_tx_id: 1000,
-        };
-        
-        // Bootstrap core schema attributes
-        db.bootstrap_schema();
-        db
-    }
-    
-    fn bootstrap_schema(&mut self) {
-        // Core attributes for the schema itself
-        self.register_attribute(Attribute {
-            id: AttributeId(1),
-            ident: "db/ident".to_string(),
-            value_type: ValueType::String,
-            cardinality: Cardinality::One,
-            indexed: true,
-            unique: Some(Uniqueness::Identity),
-        });
-        
-        self.register_attribute(Attribute {
-            id: AttributeId(2),
-            ident: "db/valueType".to_string(),
-            value_type: ValueType::Ref,
-            cardinality: Cardinality::One,
-            indexed: false,
-            unique: None,
-        });
-        
-        // User-facing attributes
-        self.register_attribute(Attribute {
-            id: AttributeId(100),
-            ident: "user/did".to_string(),
-            value_type: ValueType::String,
-            cardinality: Cardinality::One,
-            indexed: true,
-            unique: Some(Uniqueness::Identity),
-        });
-        
-        self.register_attribute(Attribute {
-            id: AttributeId(101),
-            ident: "user/pubkey".to_string(),
-            value_type: ValueType::Bytes,
-            cardinality: Cardinality::One,
-            indexed: false,
-            unique: None,
-        });
-        
-        self.register_attribute(Attribute {
-            id: AttributeId(102),
-            ident: "user/trust".to_string(),
-            value_type: ValueType::Double,
-            cardinality: Cardinality::One,
-            indexed: true,
-            unique: None,
-        });
-    }
-    
-    fn register_attribute(&mut self, attr: Attribute) {
-        self.schema_by_ident.insert(attr.ident.clone(), attr.id);
-        self.schema.insert(attr.id, attr);
-    }
-    
-    pub fn allocate_entity_id(&mut self) -> EntityId {
-        let id = EntityId(self.next_entity_id);
-        self.next_entity_id += 1;
-        id
-    }
-    
-    pub fn allocate_tx_id(&mut self) -> TxId {
-        let id = TxId(self.next_tx_id);
-        self.next_tx_id += 1;
-        id
-    }
-    
-    // Apply a transaction's datoms to all indexes
-    pub fn apply_transaction(&mut self, tx: Transaction) -> Result<(), String> {
-        // Validate all datoms against schema
-        for datom in &tx.datoms {
-            self.validate_datom(datom)?;
-        }
-        
-        // Apply each datom
-        for datom in &tx.datoms {
-            match datom.op {
-                Op::Assert => self.assert_datom(datom.clone()),
-                Op::Retract => self.retract_datom(datom.clone()),
-            }
-        }
-        
-        // Store transaction in log
-        self.tx_log.insert(tx.id, tx);
-        
-        Ok(())
-    }
-    
-    fn validate_datom(&self, datom: &Datom) -> Result<(), String> {
-        let attr = self.schema.get(&datom.attribute)
-            .ok_or_else(|| format!("Unknown attribute: {:?}", datom.attribute))?;
-        
-        // Validate value type
-        let valid_type = match (&datom.value, attr.value_type) {
-            (Value::Boolean(_), ValueType::Boolean) => true,
-            (Value::Long(_), ValueType::Long) => true,
-            (Value::String(_), ValueType::String) => true,
-            (Value::Ref(_), ValueType::Ref) => true,
-            (Value::Instant(_), ValueType::Instant) => true,
-            (Value::Bytes(_), ValueType::Bytes) => true,
-            (Value::Double(_), ValueType::Double) => true,
-            _ => false,
-        };
-        
-        if !valid_type {
-            return Err(format!("Type mismatch for attribute {}: expected {:?}", 
-                attr.ident, attr.value_type));
-        }
-        
-        Ok(())
-    }
-    
-    fn assert_datom(&mut self, datom: Datom) {
-        // Add to EAVT index
-        self.eavt.insert(
-            (datom.entity, datom.attribute, datom.value.clone(), datom.tx),
-            datom.clone()
-        );
-        
-        // Add to AEVT index
-        self.aevt.insert(
-            (datom.attribute, datom.entity, datom.value.clone(), datom.tx),
-            datom.clone()
-        );
-        
-        // Add to AVET index if indexed
-        if let Some(attr) = self.schema.get(&datom.attribute) {
-            if attr.indexed {
-                self.avet.insert(
-                    (datom.attribute, datom.value.clone(), datom.entity, datom.tx),
-                    datom.clone()
-                );
-            }
-        }
-        
-        // Add to VAET index if it's a ref
-        if let Value::Ref(ref_entity) = datom.value {
-            self.vaet.insert(
-                (ref_entity, datom.attribute, datom.entity, datom.tx),
-                ()
-            );
-        }
-    }
-    
-    fn retract_datom(&mut self, datom: Datom) {
-        // We keep the retraction in the log but remove from current indexes
-        // This is how Datomic maintains history - retractions are facts too
-        
-        // Find and remove from EAVT
-        let eavt_key = (datom.entity, datom.attribute, datom.value.clone(), datom.tx);
-        self.eavt.remove(&eavt_key);
-        
-        // Remove from other indexes similarly
-        let aevt_key = (datom.attribute, datom.entity, datom.value.clone(), datom.tx);
-        self.aevt.remove(&aevt_key);
-        
-        if let Some(attr) = self.schema.get(&datom.attribute) {
-            if attr.indexed {
-                let avet_key = (datom.attribute, datom.value.clone(), datom.entity, datom.tx);
-                self.avet.remove(&avet_key);
-            }
-        }
-        
-        if let Value::Ref(ref_entity) = datom.value {
-            let vaet_key = (ref_entity, datom.attribute, datom.entity, datom.tx);
-            self.vaet.remove(&vaet_key);
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Message {
+    Connect(Did, Vec<u8>, [u8; 32]),
+    Challenge([u8; 32]),
+    Response(Vec<u8>),
+    Elaborate(String),
+    Propose(Did, Entry, String),
+    Vote(Did, Cid, bool, String, Vec<u8>),
+    Heartbeat(Did),
+    Shutdown,
 }
 
 // ============================================================================
